@@ -6,7 +6,11 @@ import requests
 
 from letta.constants import CLI_WARNING_PREFIX
 from letta.errors import LettaConfigurationError, RateLimitExceededError
-from letta.llm_api.anthropic import anthropic_bedrock_chat_completions_request, anthropic_chat_completions_request
+from letta.llm_api.anthropic import (
+    anthropic_bedrock_chat_completions_request,
+    anthropic_chat_completions_process_stream,
+    anthropic_chat_completions_request,
+)
 from letta.llm_api.aws_bedrock import has_valid_aws_credentials
 from letta.llm_api.azure_openai import azure_openai_chat_completions_request
 from letta.llm_api.google_ai import convert_tools_to_google_ai_format, google_ai_chat_completions_request
@@ -52,7 +56,9 @@ def retry_with_exponential_backoff(
         while True:
             try:
                 return func(*args, **kwargs)
-
+            except KeyboardInterrupt:
+                # Stop retrying if user hits Ctrl-C
+                raise KeyboardInterrupt("User intentionally stopped thread. Stopping...")
             except requests.exceptions.HTTPError as http_err:
 
                 if not hasattr(http_err, "response") or not http_err.response:
@@ -105,7 +111,6 @@ def create(
     # streaming?
     stream: bool = False,
     stream_interface: Optional[Union[AgentRefreshStreamingInterface, AgentChunkStreamingInterface]] = None,
-    max_tokens: Optional[int] = None,
     model_settings: Optional[dict] = None,  # TODO: eventually pass from server
 ) -> ChatCompletionResponse:
     """Return response to chat completion with backoff"""
@@ -137,6 +142,11 @@ def create(
         if model_settings.openai_api_key is None and llm_config.model_endpoint == "https://api.openai.com/v1":
             # only is a problem if we are *not* using an openai proxy
             raise LettaConfigurationError(message="OpenAI key is missing from letta config file", missing_fields=["openai_api_key"])
+        elif model_settings.openai_api_key is None:
+            # the openai python client requires a dummy API key
+            api_key = "DUMMY_API_KEY"
+        else:
+            api_key = model_settings.openai_api_key
 
         if function_call is None and functions is not None and len(functions) > 0:
             # force function calling for reliability, see https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
@@ -146,15 +156,15 @@ def create(
             else:
                 function_call = "required"
 
-        data = build_openai_chat_completions_request(llm_config, messages, user_id, functions, function_call, use_tool_naming, max_tokens)
+        data = build_openai_chat_completions_request(llm_config, messages, user_id, functions, function_call, use_tool_naming)
         if stream:  # Client requested token streaming
             data.stream = True
             assert isinstance(stream_interface, AgentChunkStreamingInterface) or isinstance(
                 stream_interface, AgentRefreshStreamingInterface
             ), type(stream_interface)
             response = openai_chat_completions_process_stream(
-                url=llm_config.model_endpoint,  # https://api.openai.com/v1 -> https://api.openai.com/v1/chat/completions
-                api_key=model_settings.openai_api_key,
+                url=llm_config.model_endpoint,
+                api_key=api_key,
                 chat_completion_request=data,
                 stream_interface=stream_interface,
             )
@@ -164,8 +174,8 @@ def create(
                 stream_interface.stream_start()
             try:
                 response = openai_chat_completions_request(
-                    url=llm_config.model_endpoint,  # https://api.openai.com/v1 -> https://api.openai.com/v1/chat/completions
-                    api_key=model_settings.openai_api_key,
+                    url=llm_config.model_endpoint,
+                    api_key=api_key,
                     chat_completion_request=data,
                 )
             finally:
@@ -201,7 +211,7 @@ def create(
         # For Azure, this model_endpoint is required to be configured via env variable, so users don't need to provide it in the LLM config
         llm_config.model_endpoint = model_settings.azure_base_url
         chat_completion_request = build_openai_chat_completions_request(
-            llm_config, messages, user_id, functions, function_call, use_tool_naming, max_tokens
+            llm_config, messages, user_id, functions, function_call, use_tool_naming
         )
 
         response = azure_openai_chat_completions_request(
@@ -237,32 +247,52 @@ def create(
             data=dict(
                 contents=[m.to_google_ai_dict() for m in messages],
                 tools=tools,
+                generation_config={"temperature": llm_config.temperature, "max_output_tokens": llm_config.max_tokens},
             ),
             inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
         )
 
     elif llm_config.model_endpoint_type == "anthropic":
-        if stream:
-            raise NotImplementedError(f"Streaming not yet implemented for {llm_config.model_endpoint_type}")
         if not use_tool_naming:
             raise NotImplementedError("Only tool calling supported on Anthropic API requests")
 
+        # Force tool calling
         tool_call = None
         if force_tool_call is not None:
             tool_call = {"type": "function", "function": {"name": force_tool_call}}
             assert functions is not None
 
-        return anthropic_chat_completions_request(
-            data=ChatCompletionRequest(
-                model=llm_config.model,
-                messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
-                tools=[{"type": "function", "function": f} for f in functions] if functions else None,
-                tool_choice=tool_call,
-                # user=str(user_id),
-                # NOTE: max_tokens is required for Anthropic API
-                max_tokens=1024,  # TODO make dynamic
-            ),
+        chat_completion_request = ChatCompletionRequest(
+            model=llm_config.model,
+            messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
+            tools=([{"type": "function", "function": f} for f in functions] if functions else None),
+            tool_choice=tool_call,
+            max_tokens=llm_config.max_tokens,  # Note: max_tokens is required for Anthropic API
+            temperature=llm_config.temperature,
+            stream=stream,
         )
+
+        # Handle streaming
+        if stream:  # Client requested token streaming
+            assert isinstance(stream_interface, (AgentChunkStreamingInterface, AgentRefreshStreamingInterface)), type(stream_interface)
+
+            response = anthropic_chat_completions_process_stream(
+                chat_completion_request=chat_completion_request,
+                put_inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
+                stream_interface=stream_interface,
+            )
+
+        else:
+            # Client did not request token streaming (expect a blocking backend response)
+            response = anthropic_chat_completions_request(
+                data=chat_completion_request,
+                put_inner_thoughts_in_kwargs=llm_config.put_inner_thoughts_in_kwargs,
+            )
+
+        if llm_config.put_inner_thoughts_in_kwargs:
+            response = unpack_all_inner_thoughts_from_kwargs(response=response, inner_thoughts_key=INNER_THOUGHTS_KWARG)
+
+        return response
 
     # elif llm_config.model_endpoint_type == "cohere":
     #     if stream:
@@ -290,7 +320,6 @@ def create(
     #             # max_tokens=1024,  # TODO make dynamic
     #         ),
     #     )
-
     elif llm_config.model_endpoint_type == "groq":
         if stream:
             raise NotImplementedError(f"Streaming not yet implemented for Groq.")
@@ -393,7 +422,7 @@ def create(
                 tool_choice=tool_call,
                 # user=str(user_id),
                 # NOTE: max_tokens is required for Anthropic API
-                max_tokens=1024,  # TODO make dynamic
+                max_tokens=llm_config.max_tokens,
             ),
         )
 

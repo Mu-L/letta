@@ -50,9 +50,7 @@ BASE_TOOLS = ["send_message", "conversation_search", "archival_memory_insert", "
 # Base memory tools CAN be edited, and are added by default by the server
 BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace"]
 # Multi agent tools
-MULTI_AGENT_TOOLS = ["send_message_to_specific_agent", "send_message_to_agents_matching_all_tags"]
-MULTI_AGENT_SEND_MESSAGE_MAX_RETRIES = 3
-MULTI_AGENT_SEND_MESSAGE_TIMEOUT = 20 * 60
+MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_all_tags", "send_message_to_agent_async"]
 
 # The name of the tool used to send message to the user
 # May not be relevant in cases where the agent has multiple ways to message to user (send_imessage, send_discord_mesasge, ...)
@@ -125,8 +123,6 @@ LLM_MAX_TOKENS = {
     "gpt-3.5-turbo-16k-0613": 16385,  # legacy
     "gpt-3.5-turbo-0301": 4096,  # legacy
 }
-# The amount of tokens before a sytem warning about upcoming truncation is sent to Letta
-MESSAGE_SUMMARY_WARNING_FRAC = 0.75
 # The error message that Letta will receive
 # MESSAGE_SUMMARY_WARNING_STR = f"Warning: the conversation history will soon reach its maximum length and be trimmed. Make sure to save any important information from the conversation to your memory before it is removed."
 # Much longer and more specific variant of the prompt
@@ -138,14 +134,9 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
         # "Remember to pass request_heartbeat = true if you would like to send a message immediately after.",
     ]
 )
-# The fraction of tokens we truncate down to
-MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = 0.75
+
 # The ackknowledgement message used in the summarize sequence
 MESSAGE_SUMMARY_REQUEST_ACK = "Understood, I will respond with a summary of the message (and only the summary, nothing else) once I receive the conversation history. I'm ready."
-
-# Even when summarizing, we want to keep a handful of recent messages
-# These serve as in-context examples of how to use functions / what user messages look like
-MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST = 3
 
 # Maximum length of an error message
 MAX_ERROR_MESSAGE_CHAR_LIMIT = 500
@@ -157,6 +148,7 @@ CORE_MEMORY_BLOCK_CHAR_LIMIT: int = 5000
 
 # Function return limits
 FUNCTION_RETURN_CHAR_LIMIT = 6000  # ~300 words
+BASE_FUNCTION_RETURN_CHAR_LIMIT = 1000000  # very high (we rely on implementation)
 
 MAX_PAUSE_HEARTBEATS = 360  # in min
 

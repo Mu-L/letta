@@ -1,3 +1,4 @@
+import warnings
 from datetime import datetime
 from typing import List, Optional
 
@@ -7,8 +8,10 @@ from letta.constants import LLM_MAX_TOKENS, MIN_CONTEXT_WINDOW
 from letta.llm_api.azure_openai import get_azure_chat_completions_endpoint, get_azure_embeddings_endpoint
 from letta.llm_api.azure_openai_constants import AZURE_MODEL_TO_CONTEXT_LENGTH
 from letta.schemas.embedding_config import EmbeddingConfig
+from letta.schemas.embedding_config_overrides import EMBEDDING_HANDLE_OVERRIDES
 from letta.schemas.letta_base import LettaBase
 from letta.schemas.llm_config import LLMConfig
+from letta.schemas.llm_config_overrides import LLM_HANDLE_OVERRIDES
 
 
 class ProviderBase(LettaBase):
@@ -39,7 +42,21 @@ class Provider(ProviderBase):
         """String representation of the provider for display purposes"""
         raise NotImplementedError
 
-    def get_handle(self, model_name: str) -> str:
+    def get_handle(self, model_name: str, is_embedding: bool = False) -> str:
+        """
+        Get the handle for a model, with support for custom overrides.
+
+        Args:
+            model_name (str): The name of the model.
+            is_embedding (bool, optional): Whether the handle is for an embedding model. Defaults to False.
+
+        Returns:
+            str: The handle for the model.
+        """
+        overrides = EMBEDDING_HANDLE_OVERRIDES if is_embedding else LLM_HANDLE_OVERRIDES
+        if self.name in overrides and model_name in overrides[self.name]:
+            model_name = overrides[self.name][model_name]
+
         return f"{self.name}/{model_name}"
 
 
@@ -76,7 +93,7 @@ class LettaProvider(Provider):
                 embedding_endpoint="https://embeddings.memgpt.ai",
                 embedding_dim=1024,
                 embedding_chunk_size=300,
-                handle=self.get_handle("letta-free"),
+                handle=self.get_handle("letta-free", is_embedding=True),
             )
         ]
 
@@ -167,7 +184,7 @@ class OpenAIProvider(Provider):
                 embedding_endpoint="https://api.openai.com/v1",
                 embedding_dim=1536,
                 embedding_chunk_size=300,
-                handle=self.get_handle("text-embedding-ada-002"),
+                handle=self.get_handle("text-embedding-ada-002", is_embedding=True),
             ),
             EmbeddingConfig(
                 embedding_model="text-embedding-3-small",
@@ -175,7 +192,7 @@ class OpenAIProvider(Provider):
                 embedding_endpoint="https://api.openai.com/v1",
                 embedding_dim=2000,
                 embedding_chunk_size=300,
-                handle=self.get_handle("text-embedding-3-small"),
+                handle=self.get_handle("text-embedding-3-small", is_embedding=True),
             ),
             EmbeddingConfig(
                 embedding_model="text-embedding-3-large",
@@ -183,7 +200,7 @@ class OpenAIProvider(Provider):
                 embedding_endpoint="https://api.openai.com/v1",
                 embedding_dim=2000,
                 embedding_chunk_size=300,
-                handle=self.get_handle("text-embedding-3-large"),
+                handle=self.get_handle("text-embedding-3-large", is_embedding=True),
             ),
         ]
 
@@ -192,6 +209,130 @@ class OpenAIProvider(Provider):
             return LLM_MAX_TOKENS[model_name]
         else:
             return None
+
+
+class LMStudioOpenAIProvider(OpenAIProvider):
+    name: str = "lmstudio-openai"
+    base_url: str = Field(..., description="Base URL for the LMStudio OpenAI API.")
+    api_key: Optional[str] = Field(None, description="API key for the LMStudio API.")
+
+    def list_llm_models(self) -> List[LLMConfig]:
+        from letta.llm_api.openai import openai_get_model_list
+
+        # For LMStudio, we want to hit 'GET /api/v0/models' instead of 'GET /v1/models'
+        MODEL_ENDPOINT_URL = f"{self.base_url.strip('/v1')}/api/v0"
+        response = openai_get_model_list(MODEL_ENDPOINT_URL)
+
+        """
+        Example response:
+
+        {
+          "object": "list",
+          "data": [
+            {
+              "id": "qwen2-vl-7b-instruct",
+              "object": "model",
+              "type": "vlm",
+              "publisher": "mlx-community",
+              "arch": "qwen2_vl",
+              "compatibility_type": "mlx",
+              "quantization": "4bit",
+              "state": "not-loaded",
+              "max_context_length": 32768
+            },
+            ...
+        """
+        if "data" not in response:
+            warnings.warn(f"LMStudio OpenAI model query response missing 'data' field: {response}")
+            return []
+
+        configs = []
+        for model in response["data"]:
+            assert "id" in model, f"Model missing 'id' field: {model}"
+            model_name = model["id"]
+
+            if "type" not in model:
+                warnings.warn(f"LMStudio OpenAI model missing 'type' field: {model}")
+                continue
+            elif model["type"] not in ["vlm", "llm"]:
+                continue
+
+            if "max_context_length" in model:
+                context_window_size = model["max_context_length"]
+            else:
+                warnings.warn(f"LMStudio OpenAI model missing 'max_context_length' field: {model}")
+                continue
+
+            configs.append(
+                LLMConfig(
+                    model=model_name,
+                    model_endpoint_type="openai",
+                    model_endpoint=self.base_url,
+                    context_window=context_window_size,
+                    handle=self.get_handle(model_name),
+                )
+            )
+
+        return configs
+
+    def list_embedding_models(self) -> List[EmbeddingConfig]:
+        from letta.llm_api.openai import openai_get_model_list
+
+        # For LMStudio, we want to hit 'GET /api/v0/models' instead of 'GET /v1/models'
+        MODEL_ENDPOINT_URL = f"{self.base_url.strip('/v1')}/api/v0"
+        response = openai_get_model_list(MODEL_ENDPOINT_URL)
+
+        """
+        Example response:
+        {
+          "object": "list",
+          "data": [
+            {
+              "id": "text-embedding-nomic-embed-text-v1.5",
+              "object": "model",
+              "type": "embeddings",
+              "publisher": "nomic-ai",
+              "arch": "nomic-bert",
+              "compatibility_type": "gguf",
+              "quantization": "Q4_0",
+              "state": "not-loaded",
+              "max_context_length": 2048
+            }
+            ...
+        """
+        if "data" not in response:
+            warnings.warn(f"LMStudio OpenAI model query response missing 'data' field: {response}")
+            return []
+
+        configs = []
+        for model in response["data"]:
+            assert "id" in model, f"Model missing 'id' field: {model}"
+            model_name = model["id"]
+
+            if "type" not in model:
+                warnings.warn(f"LMStudio OpenAI model missing 'type' field: {model}")
+                continue
+            elif model["type"] not in ["embeddings"]:
+                continue
+
+            if "max_context_length" in model:
+                context_window_size = model["max_context_length"]
+            else:
+                warnings.warn(f"LMStudio OpenAI model missing 'max_context_length' field: {model}")
+                continue
+
+            configs.append(
+                EmbeddingConfig(
+                    embedding_model=model_name,
+                    embedding_endpoint_type="openai",
+                    embedding_endpoint=self.base_url,
+                    embedding_dim=context_window_size,
+                    embedding_chunk_size=300,
+                    handle=self.get_handle(model_name),
+                ),
+            )
+
+        return configs
 
 
 class AnthropicProvider(Provider):
@@ -206,6 +347,15 @@ class AnthropicProvider(Provider):
 
         configs = []
         for model in models:
+
+            # We set this to false by default, because Anthropic can
+            # natively support <thinking> tags inside of content fields
+            # However, putting COT inside of tool calls can make it more
+            # reliable for tool calling (no chance of a non-tool call step)
+            # Since tool_choice_type 'any' doesn't work with in-content COT
+            # NOTE For Haiku, it can be flaky if we don't enable this by default
+            inner_thoughts_in_kwargs = True if "haiku" in model["name"] else False
+
             configs.append(
                 LLMConfig(
                     model=model["name"],
@@ -213,6 +363,7 @@ class AnthropicProvider(Provider):
                     model_endpoint=self.base_url,
                     context_window=model["context_window"],
                     handle=self.get_handle(model["name"]),
+                    put_inner_thoughts_in_kwargs=inner_thoughts_in_kwargs,
                 )
             )
         return configs
@@ -377,7 +528,7 @@ class OllamaProvider(OpenAIProvider):
                     embedding_endpoint=self.base_url,
                     embedding_dim=embedding_dim,
                     embedding_chunk_size=300,
-                    handle=self.get_handle(model["name"]),
+                    handle=self.get_handle(model["name"], is_embedding=True),
                 )
             )
         return configs
@@ -575,7 +726,7 @@ class GoogleAIProvider(Provider):
                     embedding_endpoint=self.base_url,
                     embedding_dim=768,
                     embedding_chunk_size=300,  # NOTE: max is 2048
-                    handle=self.get_handle(model),
+                    handle=self.get_handle(model, is_embedding=True),
                 )
             )
         return configs
@@ -641,7 +792,7 @@ class AzureProvider(Provider):
                     embedding_endpoint=model_endpoint,
                     embedding_dim=768,
                     embedding_chunk_size=300,  # NOTE: max is 2048
-                    handle=self.get_handle(model_name),
+                    handle=self.get_handle(model_name, is_embedding=True),
                 )
             )
         return configs

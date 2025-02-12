@@ -8,14 +8,18 @@ from composio.tools.base.abs import InvalidClassDefinition
 from fastapi import APIRouter, Body, Depends, Header, HTTPException
 
 from letta.errors import LettaToolCreateError
+from letta.log import get_logger
 from letta.orm.errors import UniqueConstraintViolationError
 from letta.schemas.letta_message import ToolReturnMessage
 from letta.schemas.tool import Tool, ToolCreate, ToolRunFromSource, ToolUpdate
 from letta.schemas.user import User
 from letta.server.rest_api.utils import get_letta_server
 from letta.server.server import SyncServer
+from letta.settings import tool_settings
 
 router = APIRouter(prefix="/tools", tags=["tools"])
+
+logger = get_logger(__name__)
 
 
 @router.delete("/{tool_id}", operation_id="delete_tool")
@@ -31,8 +35,8 @@ def delete_tool(
     server.tool_manager.delete_tool_by_id(tool_id=tool_id, actor=actor)
 
 
-@router.get("/{tool_id}", response_model=Tool, operation_id="get_tool")
-def get_tool(
+@router.get("/{tool_id}", response_model=Tool, operation_id="retrieve_tool")
+def retrieve_tool(
     tool_id: str,
     server: SyncServer = Depends(get_letta_server),
     user_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -48,27 +52,11 @@ def get_tool(
     return tool
 
 
-@router.get("/name/{tool_name}", response_model=str, operation_id="get_tool_id_by_name")
-def get_tool_id(
-    tool_name: str,
-    server: SyncServer = Depends(get_letta_server),
-    user_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
-):
-    """
-    Get a tool ID by name
-    """
-    actor = server.user_manager.get_user_or_default(user_id=user_id)
-    tool = server.tool_manager.get_tool_by_name(tool_name=tool_name, actor=actor)
-    if tool:
-        return tool.id
-    else:
-        raise HTTPException(status_code=404, detail=f"Tool with name {tool_name} and organization id {actor.organization_id} not found.")
-
-
 @router.get("/", response_model=List[Tool], operation_id="list_tools")
 def list_tools(
-    cursor: Optional[str] = None,
+    after: Optional[str] = None,
     limit: Optional[int] = 50,
+    name: Optional[str] = None,
     server: SyncServer = Depends(get_letta_server),
     user_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
@@ -77,7 +65,10 @@ def list_tools(
     """
     try:
         actor = server.user_manager.get_user_or_default(user_id=user_id)
-        return server.tool_manager.list_tools(actor=actor, cursor=cursor, limit=limit)
+        if name is not None:
+            tool = server.tool_manager.get_tool_by_name(tool_name=name, actor=actor)
+            return [tool] if tool else []
+        return server.tool_manager.list_tools(actor=actor, after=after, limit=limit)
     except Exception as e:
         # Log or print the full exception here for debugging
         print(f"Error occurred: {e}")
@@ -100,7 +91,7 @@ def create_tool(
     except UniqueConstraintViolationError as e:
         # Log or print the full exception here for debugging
         print(f"Error occurred: {e}")
-        clean_error_message = f"Tool with name {request.name} already exists."
+        clean_error_message = f"Tool with this name already exists."
         raise HTTPException(status_code=409, detail=clean_error_message)
     except LettaToolCreateError as e:
         # HTTP 400 == Bad Request
@@ -139,8 +130,8 @@ def upsert_tool(
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
-@router.patch("/{tool_id}", response_model=Tool, operation_id="update_tool")
-def update_tool(
+@router.patch("/{tool_id}", response_model=Tool, operation_id="modify_tool")
+def modify_tool(
     tool_id: str,
     request: ToolUpdate = Body(...),
     server: SyncServer = Depends(get_letta_server),
@@ -237,11 +228,10 @@ def add_composio_tool(
     Add a new Composio tool by action name (Composio refers to each tool as an `Action`)
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    composio_api_key = get_composio_key(server, actor=actor)
 
     try:
-        tool_create = ToolCreate.from_composio(action_name=composio_action_name, api_key=composio_api_key)
-        return server.tool_manager.create_or_update_tool(pydantic_tool=Tool(**tool_create.model_dump()), actor=actor)
+        tool_create = ToolCreate.from_composio(action_name=composio_action_name)
+        return server.tool_manager.create_or_update_composio_tool(tool_create=tool_create, actor=actor)
     except EnumStringNotFound as e:
         raise HTTPException(
             status_code=400,  # Bad Request
@@ -311,12 +301,18 @@ def add_composio_tool(
 def get_composio_key(server: SyncServer, actor: User):
     api_keys = server.sandbox_config_manager.list_sandbox_env_vars_by_key(key="COMPOSIO_API_KEY", actor=actor)
     if not api_keys:
-        raise HTTPException(
-            status_code=400,  # Bad Request
-            detail=f"No API keys found for Composio. Please add your Composio API Key as an environment variable for your sandbox configuration.",
-        )
+        logger.warning(f"No API keys found for Composio. Defaulting to the environment variable...")
 
-    # TODO: Add more protections around this
-    # Ideally, not tied to a specific sandbox, but for now we just get the first one
-    # Theoretically possible for someone to have different composio api keys per sandbox
-    return api_keys[0].value
+        if tool_settings.composio_api_key:
+            return tool_settings.composio_api_key
+        else:
+            # Nothing, raise fatal warning
+            raise HTTPException(
+                status_code=400,  # Bad Request
+                detail=f"No API keys found for Composio. Please add your Composio API Key as an environment variable for your sandbox configuration, or set it as environment variable COMPOSIO_API_KEY.",
+            )
+    else:
+        # TODO: Add more protections around this
+        # Ideally, not tied to a specific sandbox, but for now we just get the first one
+        # Theoretically possible for someone to have different composio api keys per sandbox
+        return api_keys[0].value

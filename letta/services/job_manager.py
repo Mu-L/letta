@@ -14,9 +14,8 @@ from letta.orm.sqlalchemy_base import AccessType
 from letta.orm.step import Step
 from letta.schemas.enums import JobStatus, MessageRole
 from letta.schemas.job import Job as PydanticJob
-from letta.schemas.job import JobUpdate
+from letta.schemas.job import JobUpdate, LettaRequestConfig
 from letta.schemas.letta_message import LettaMessage
-from letta.schemas.letta_request import LettaRequestConfig
 from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.run import Run as PydanticRun
 from letta.schemas.usage import LettaUsageStatistics
@@ -39,7 +38,7 @@ class JobManager:
         with self.session_maker() as session:
             # Associate the job with the user
             pydantic_job.user_id = actor.id
-            job_data = pydantic_job.model_dump()
+            job_data = pydantic_job.model_dump(to_orm=True)
             job = JobModel(**job_data)
             job.create(session, actor=actor)  # Save job in the database
         return job.to_pydantic()
@@ -52,7 +51,7 @@ class JobManager:
             job = self._verify_job_access(session=session, job_id=job_id, actor=actor, access=["write"])
 
             # Update job attributes with only the fields that were explicitly set
-            update_data = job_update.model_dump(exclude_unset=True, exclude_none=True)
+            update_data = job_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
 
             # Automatically update the completion timestamp if status is set to 'completed'
             if update_data.get("status") == JobStatus.completed and not job.completed_at:
@@ -62,7 +61,9 @@ class JobManager:
                 setattr(job, key, value)
 
             # Save the updated job to the database
-            return job.update(db_session=session)  # TODO: Add this later , actor=actor)
+            job.update(db_session=session)  # TODO: Add this later , actor=actor)
+
+            return job.to_pydantic()
 
     @enforce_types
     def get_job_by_id(self, job_id: str, actor: PydanticUser) -> PydanticJob:
@@ -76,10 +77,12 @@ class JobManager:
     def list_jobs(
         self,
         actor: PydanticUser,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         limit: Optional[int] = 50,
         statuses: Optional[List[JobStatus]] = None,
         job_type: JobType = JobType.JOB,
+        ascending: bool = True,
     ) -> List[PydanticJob]:
         """List all jobs with optional pagination and status filter."""
         with self.session_maker() as session:
@@ -91,8 +94,10 @@ class JobManager:
 
             jobs = JobModel.list(
                 db_session=session,
-                cursor=cursor,
+                before=before,
+                after=after,
                 limit=limit,
+                ascending=ascending,
                 **filter_kwargs,
             )
             return [job.to_pydantic() for job in jobs]
@@ -110,7 +115,8 @@ class JobManager:
         self,
         job_id: str,
         actor: PydanticUser,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         limit: Optional[int] = 100,
         role: Optional[MessageRole] = None,
         ascending: bool = True,
@@ -121,7 +127,8 @@ class JobManager:
         Args:
             job_id: The ID of the job to get messages for
             actor: The user making the request
-            cursor: Cursor for pagination
+            before: Cursor for pagination
+            after: Cursor for pagination
             limit: Maximum number of messages to return
             role: Optional filter for message role
             ascending: Optional flag to sort in ascending order
@@ -141,7 +148,8 @@ class JobManager:
             # Get messages
             messages = MessageModel.list(
                 db_session=session,
-                cursor=cursor,
+                before=before,
+                after=after,
                 ascending=ascending,
                 limit=limit,
                 actor=actor,
@@ -253,11 +261,12 @@ class JobManager:
             session.commit()
 
     @enforce_types
-    def get_run_messages_cursor(
+    def get_run_messages(
         self,
         run_id: str,
         actor: PydanticUser,
-        cursor: Optional[str] = None,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
         limit: Optional[int] = 100,
         role: Optional[MessageRole] = None,
         ascending: bool = True,
@@ -269,7 +278,8 @@ class JobManager:
         Args:
             job_id: The ID of the job to get messages for
             actor: The user making the request
-            cursor: Message ID to get messages after or before
+            before: Message ID to get messages after
+            after: Message ID to get messages before
             limit: Maximum number of messages to return
             ascending: Whether to return messages in ascending order
             role: Optional role filter
@@ -283,7 +293,8 @@ class JobManager:
         messages = self.get_job_messages(
             job_id=run_id,
             actor=actor,
-            cursor=cursor,
+            before=before,
+            after=after,
             limit=limit,
             role=role,
             ascending=ascending,
@@ -291,16 +302,12 @@ class JobManager:
 
         request_config = self._get_run_request_config(run_id)
 
-        # Convert messages to LettaMessages
-        messages = [
-            msg
-            for m in messages
-            for msg in m.to_letta_message(
-                assistant_message=request_config["use_assistant_message"],
-                assistant_message_tool_name=request_config["assistant_message_tool_name"],
-                assistant_message_tool_kwarg=request_config["assistant_message_tool_kwarg"],
-            )
-        ]
+        messages = PydanticMessage.to_letta_messages_from_list(
+            messages=messages,
+            use_assistant_message=request_config["use_assistant_message"],
+            assistant_message_tool_name=request_config["assistant_message_tool_name"],
+            assistant_message_tool_kwarg=request_config["assistant_message_tool_kwarg"],
+        )
 
         return messages
 
