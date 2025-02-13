@@ -2,17 +2,20 @@ import importlib
 import warnings
 from typing import List, Optional
 
-from letta.constants import BASE_MEMORY_TOOLS, BASE_TOOLS, MULTI_AGENT_TOOLS
+from letta.constants import BASE_FUNCTION_RETURN_CHAR_LIMIT, BASE_MEMORY_TOOLS, BASE_TOOLS, MULTI_AGENT_TOOLS
 from letta.functions.functions import derive_openai_json_schema, load_function_set
+from letta.log import get_logger
 from letta.orm.enums import ToolType
 
 # TODO: Remove this once we translate all of these to the ORM
 from letta.orm.errors import NoResultFound
 from letta.orm.tool import Tool as ToolModel
 from letta.schemas.tool import Tool as PydanticTool
-from letta.schemas.tool import ToolUpdate
+from letta.schemas.tool import ToolCreate, ToolUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.utils import enforce_types, printd
+
+logger = get_logger(__name__)
 
 
 class ToolManager:
@@ -39,7 +42,7 @@ class ToolManager:
         tool = self.get_tool_by_name(tool_name=pydantic_tool.name, actor=actor)
         if tool:
             # Put to dict and remove fields that should not be reset
-            update_data = pydantic_tool.model_dump(exclude_unset=True, exclude_none=True)
+            update_data = pydantic_tool.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
 
             # If there's anything to update
             if update_data:
@@ -54,6 +57,18 @@ class ToolManager:
         return tool
 
     @enforce_types
+    def create_or_update_composio_tool(self, tool_create: ToolCreate, actor: PydanticUser) -> PydanticTool:
+        return self.create_or_update_tool(
+            PydanticTool(tool_type=ToolType.EXTERNAL_COMPOSIO, name=tool_create.json_schema["name"], **tool_create.model_dump()), actor
+        )
+
+    @enforce_types
+    def create_or_update_langchain_tool(self, tool_create: ToolCreate, actor: PydanticUser) -> PydanticTool:
+        return self.create_or_update_tool(
+            PydanticTool(tool_type=ToolType.EXTERNAL_LANGCHAIN, name=tool_create.json_schema["name"], **tool_create.model_dump()), actor
+        )
+
+    @enforce_types
     def create_tool(self, pydantic_tool: PydanticTool, actor: PydanticUser) -> PydanticTool:
         """Create a new tool based on the ToolCreate schema."""
         with self.session_maker() as session:
@@ -62,7 +77,7 @@ class ToolManager:
             # Auto-generate description if not provided
             if pydantic_tool.description is None:
                 pydantic_tool.description = pydantic_tool.json_schema.get("description", None)
-            tool_data = pydantic_tool.model_dump()
+            tool_data = pydantic_tool.model_dump(to_orm=True)
 
             tool = ToolModel(**tool_data)
             tool.create(session, actor=actor)  # Re-raise other database-related errors
@@ -88,16 +103,29 @@ class ToolManager:
             return None
 
     @enforce_types
-    def list_tools(self, actor: PydanticUser, cursor: Optional[str] = None, limit: Optional[int] = 50) -> List[PydanticTool]:
-        """List all tools with optional pagination using cursor and limit."""
+    def list_tools(self, actor: PydanticUser, after: Optional[str] = None, limit: Optional[int] = 50) -> List[PydanticTool]:
+        """List all tools with optional pagination."""
         with self.session_maker() as session:
             tools = ToolModel.list(
                 db_session=session,
-                cursor=cursor,
+                after=after,
                 limit=limit,
                 organization_id=actor.organization_id,
             )
-            return [tool.to_pydantic() for tool in tools]
+
+        # Remove any malformed tools
+        results = []
+        for tool in tools:
+            try:
+                pydantic_tool = tool.to_pydantic()
+                results.append(pydantic_tool)
+            except (ValueError, ModuleNotFoundError, AttributeError) as e:
+                logger.warning(f"Deleting malformed tool with id={tool.id} and name={tool.name}, error was:\n{e}")
+                logger.warning("Deleted tool: ")
+                logger.warning(tool.pretty_print_columns())
+                self.delete_tool_by_id(tool.id, actor=actor)
+
+        return results
 
     @enforce_types
     def update_tool_by_id(self, tool_id: str, tool_update: ToolUpdate, actor: PydanticUser) -> PydanticTool:
@@ -107,7 +135,7 @@ class ToolManager:
             tool = ToolModel.read(db_session=session, identifier=tool_id, actor=actor)
 
             # Update tool attributes with only the fields that were explicitly set
-            update_data = tool_update.model_dump(exclude_none=True)
+            update_data = tool_update.model_dump(to_orm=True, exclude_none=True)
             for key, value in update_data.items():
                 setattr(tool, key, value)
 
@@ -117,6 +145,7 @@ class ToolManager:
                 new_schema = derive_openai_json_schema(source_code=pydantic_tool.source_code)
 
                 tool.json_schema = new_schema
+                tool.name = new_schema["name"]
 
             # Save the updated tool to the database
             return tool.update(db_session=session, actor=actor).to_pydantic()
@@ -178,6 +207,7 @@ class ToolManager:
                             tags=tags,
                             source_type="python",
                             tool_type=tool_type,
+                            return_char_limit=BASE_FUNCTION_RETURN_CHAR_LIMIT,
                         ),
                         actor=actor,
                     )

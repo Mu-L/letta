@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import JSON, String
+from sqlalchemy import JSON, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.enums import JobType
@@ -9,7 +9,7 @@ from letta.orm.mixins import UserMixin
 from letta.orm.sqlalchemy_base import SqlalchemyBase
 from letta.schemas.enums import JobStatus
 from letta.schemas.job import Job as PydanticJob
-from letta.schemas.letta_request import LettaRequestConfig
+from letta.schemas.job import LettaRequestConfig
 
 if TYPE_CHECKING:
     from letta.orm.job_messages import JobMessage
@@ -25,6 +25,7 @@ class Job(SqlalchemyBase, UserMixin):
 
     __tablename__ = "jobs"
     __pydantic_model__ = PydanticJob
+    __table_args__ = (Index("ix_jobs_created_at", "created_at", "id"),)
 
     status: Mapped[JobStatus] = mapped_column(String, default=JobStatus.created, doc="The current status of the job.")
     completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True, doc="The unix timestamp of when the job was completed.")

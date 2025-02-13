@@ -1,7 +1,7 @@
 import uuid
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import JSON, String
+from sqlalchemy import JSON, Boolean, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.block import Block
@@ -15,7 +15,7 @@ from letta.schemas.agent import AgentType
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
-from letta.schemas.tool_rule import ToolRule
+from letta.schemas.tool_rule import TerminalToolRule, ToolRule
 
 if TYPE_CHECKING:
     from letta.orm.agents_tags import AgentsTags
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 class Agent(SqlalchemyBase, OrganizationMixin):
     __tablename__ = "agents"
     __pydantic_model__ = PydanticAgentState
+    __table_args__ = (Index("ix_agents_created_at", "created_at", "id"),)
 
     # agent generates its own id
     # TODO: We want to migrate all the ORM models to do this, so we will need to move this to the SqlalchemyBase
@@ -54,9 +55,17 @@ class Agent(SqlalchemyBase, OrganizationMixin):
     embedding_config: Mapped[Optional[EmbeddingConfig]] = mapped_column(
         EmbeddingConfigColumn, doc="the embedding configuration object for this agent."
     )
+    project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The id of the project the agent belongs to.")
+    template_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The id of the template the agent belongs to.")
+    base_template_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="The base template id of the agent.")
 
     # Tool rules
     tool_rules: Mapped[Optional[List[ToolRule]]] = mapped_column(ToolRulesColumn, doc="the tool rules for this agent.")
+
+    # Stateless
+    message_buffer_autoclear: Mapped[bool] = mapped_column(
+        Boolean, doc="If set to True, the agent will not remember previous messages. Not recommended unless you have an advanced use case."
+    )
 
     # relationships
     organization: Mapped["Organization"] = relationship("Organization", back_populates="agents")
@@ -69,7 +78,14 @@ class Agent(SqlalchemyBase, OrganizationMixin):
     )
     tools: Mapped[List["Tool"]] = relationship("Tool", secondary="tools_agents", lazy="selectin", passive_deletes=True)
     sources: Mapped[List["Source"]] = relationship("Source", secondary="sources_agents", lazy="selectin")
-    core_memory: Mapped[List["Block"]] = relationship("Block", secondary="blocks_agents", lazy="selectin")
+    core_memory: Mapped[List["Block"]] = relationship(
+        "Block",
+        secondary="blocks_agents",
+        lazy="selectin",
+        passive_deletes=True,  # Ensures SQLAlchemy doesn't fetch blocks_agents rows before deleting
+        back_populates="agents",
+        doc="Blocks forming the core memory of the agent.",
+    )
     messages: Mapped[List["Message"]] = relationship(
         "Message",
         back_populates="agent",
@@ -106,6 +122,11 @@ class Agent(SqlalchemyBase, OrganizationMixin):
 
     def to_pydantic(self) -> PydanticAgentState:
         """converts to the basic pydantic model counterpart"""
+        # add default rule for having send_message be a terminal tool
+        tool_rules = self.tool_rules
+        if not tool_rules:
+            tool_rules = [TerminalToolRule(tool_name="send_message"), TerminalToolRule(tool_name="send_message_to_agent_async")]
+
         state = {
             "id": self.id,
             "organization_id": self.organization_id,
@@ -113,19 +134,24 @@ class Agent(SqlalchemyBase, OrganizationMixin):
             "description": self.description,
             "message_ids": self.message_ids,
             "tools": self.tools,
-            "sources": self.sources,
+            "sources": [source.to_pydantic() for source in self.sources],
             "tags": [t.tag for t in self.tags],
-            "tool_rules": self.tool_rules,
+            "tool_rules": tool_rules,
             "system": self.system,
             "agent_type": self.agent_type,
             "llm_config": self.llm_config,
             "embedding_config": self.embedding_config,
-            "metadata_": self.metadata_,
+            "metadata": self.metadata_,
             "memory": Memory(blocks=[b.to_pydantic() for b in self.core_memory]),
             "created_by_id": self.created_by_id,
             "last_updated_by_id": self.last_updated_by_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "tool_exec_environment_variables": self.tool_exec_environment_variables,
+            "project_id": self.project_id,
+            "template_id": self.template_id,
+            "base_template_id": self.base_template_id,
+            "message_buffer_autoclear": self.message_buffer_autoclear,
         }
+
         return self.__pydantic_model__(**state)

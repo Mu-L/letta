@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import List, Optional
 
+from openai import OpenAI
+
 from letta.embeddings import embedding_model, parse_and_chunk_text
 from letta.orm.errors import NoResultFound
 from letta.orm.passage import AgentPassage, SourcePassage
@@ -38,14 +40,14 @@ class PassageManager:
     def create_passage(self, pydantic_passage: PydanticPassage, actor: PydanticUser) -> PydanticPassage:
         """Create a new passage in the appropriate table based on whether it has agent_id or source_id."""
         # Common fields for both passage types
-        data = pydantic_passage.model_dump()
+        data = pydantic_passage.model_dump(to_orm=True)
         common_fields = {
             "id": data.get("id"),
             "text": data["text"],
             "embedding": data["embedding"],
             "embedding_config": data["embedding_config"],
             "organization_id": data["organization_id"],
-            "metadata_": data.get("metadata_", {}),
+            "metadata_": data.get("metadata", {}),
             "is_deleted": data.get("is_deleted", False),
             "created_at": data.get("created_at", datetime.utcnow()),
         }
@@ -86,14 +88,31 @@ class PassageManager:
         """Insert passage(s) into archival memory"""
 
         embedding_chunk_size = agent_state.embedding_config.embedding_chunk_size
-        embed_model = embedding_model(agent_state.embedding_config)
+
+        # TODO eventually migrate off of llama-index for embeddings?
+        # Already causing pain for OpenAI proxy endpoints like LM Studio...
+        if agent_state.embedding_config.embedding_endpoint_type != "openai":
+            embed_model = embedding_model(agent_state.embedding_config)
 
         passages = []
 
         try:
             # breakup string into passages
             for text in parse_and_chunk_text(text, embedding_chunk_size):
-                embedding = embed_model.get_text_embedding(text)
+
+                if agent_state.embedding_config.embedding_endpoint_type != "openai":
+                    embedding = embed_model.get_text_embedding(text)
+                else:
+                    # TODO should have the settings passed in via the server call
+                    from letta.settings import model_settings
+
+                    # Simple OpenAI client code
+                    client = OpenAI(
+                        api_key=model_settings.openai_api_key, base_url=agent_state.embedding_config.embedding_endpoint, max_retries=0
+                    )
+                    response = client.embeddings.create(input=text, model=agent_state.embedding_config.embedding_model)
+                    embedding = response.data[0].embedding
+
                 if isinstance(embedding, dict):
                     try:
                         embedding = embedding["data"][0]["embedding"]
@@ -145,7 +164,7 @@ class PassageManager:
                     raise ValueError(f"Passage with id {passage_id} does not exist.")
 
             # Update the database record with values from the provided record
-            update_data = passage.model_dump(exclude_unset=True, exclude_none=True)
+            update_data = passage.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
             for key, value in update_data.items():
                 setattr(curr_passage, key, value)
 

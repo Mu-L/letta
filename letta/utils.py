@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import difflib
 import hashlib
@@ -15,7 +16,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from typing import List, Union, _GenericAlias, get_args, get_origin, get_type_hints
+from logging import Logger
+from typing import Any, Coroutine, List, Union, _GenericAlias, get_args, get_origin, get_type_hints
 from urllib.parse import urljoin, urlparse
 
 import demjson3 as demjson
@@ -1127,3 +1129,41 @@ def get_friendly_error_msg(function_name: str, exception_name: str, exception_me
     if len(error_msg) > MAX_ERROR_MESSAGE_CHAR_LIMIT:
         error_msg = error_msg[:MAX_ERROR_MESSAGE_CHAR_LIMIT]
     return error_msg
+
+
+def run_async_task(coro: Coroutine[Any, Any, Any]) -> Any:
+    """
+    Safely runs an asynchronous coroutine in a synchronous context.
+
+    If an event loop is already running, it uses `asyncio.ensure_future`.
+    Otherwise, it creates a new event loop and runs the coroutine.
+
+    Args:
+        coro: The coroutine to execute.
+
+    Returns:
+        The result of the coroutine.
+    """
+    try:
+        # If there's already a running event loop, schedule the coroutine
+        loop = asyncio.get_running_loop()
+        return asyncio.run_until_complete(coro) if loop.is_closed() else asyncio.ensure_future(coro)
+    except RuntimeError:
+        # If no event loop is running, create a new one
+        return asyncio.run(coro)
+
+
+def log_telemetry(logger: Logger, event: str, **kwargs):
+    """
+    Logs telemetry events with a timestamp.
+
+    :param logger: A logger
+    :param event: A string describing the event.
+    :param kwargs: Additional key-value pairs for logging metadata.
+    """
+    from letta.settings import settings
+
+    if settings.verbose_telemetry_logging:
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S,%f UTC")  # More readable timestamp
+        extra_data = " | ".join(f"{key}={value}" for key, value in kwargs.items() if value is not None)
+        logger.info(f"[{timestamp}] EVENT: {event} | {extra_data}")

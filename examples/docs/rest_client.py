@@ -31,19 +31,19 @@ def main():
                 value="I am a friendly AI",
             ),
         ],
-        llm=llm_configs[0].handle,
+        model=llm_configs[0].handle,
         embedding=embedding_configs[0].handle,
     )
     print(f"Created agent: {agent_state.name} with ID {str(agent_state.id)}")
 
     # Send a message to the agent
     print(f"Created agent: {agent_state.name} with ID {str(agent_state.id)}")
-    response = client.agents.messages.send(
+    response = client.agents.messages.create(
         agent_id=agent_state.id, 
         messages=[
             MessageCreate(
                 role="user",
-                text="Whats my name?",
+                content="Whats my name?",
             )
         ],
     )

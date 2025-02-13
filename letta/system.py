@@ -1,5 +1,6 @@
 import json
 import uuid
+import warnings
 from typing import Optional
 
 from .constants import (
@@ -151,6 +152,15 @@ def package_function_response(was_success, response_string, timestamp=None):
 
 
 def package_system_message(system_message, message_type="system_alert", time=None):
+    # error handling for recursive packaging
+    try:
+        message_json = json.loads(system_message)
+        if "type" in message_json and message_json["type"] == message_type:
+            warnings.warn(f"Attempted to pack a system message that is already packed. Not packing: '{system_message}'")
+            return system_message
+    except:
+        pass  # do nothing, expected behavior that the message is not JSON
+
     formatted_time = time if time else get_local_time()
     packaged_message = {
         "type": message_type,
@@ -161,10 +171,10 @@ def package_system_message(system_message, message_type="system_alert", time=Non
     return json.dumps(packaged_message)
 
 
-def package_summarize_message(summary, summary_length, hidden_message_count, total_message_count, timestamp=None):
+def package_summarize_message(summary, summary_message_count, hidden_message_count, total_message_count, timestamp=None):
     context_message = (
         f"Note: prior messages ({hidden_message_count} of {total_message_count} total messages) have been hidden from view due to conversation memory constraints.\n"
-        + f"The following is a summary of the previous {summary_length} messages:\n {summary}"
+        + f"The following is a summary of the previous {summary_message_count} messages:\n {summary}"
     )
 
     formatted_time = get_local_time() if timestamp is None else timestamp
@@ -205,3 +215,26 @@ def get_token_limit_warning():
     }
 
     return json_dumps(packaged_message)
+
+
+def unpack_message(packed_message) -> str:
+    """Take a packed message string and attempt to extract the inner message content"""
+
+    try:
+        message_json = json.loads(packed_message)
+    except:
+        warnings.warn(f"Was unable to load message as JSON to unpack: '{packed_message}'")
+        return packed_message
+
+    if "message" not in message_json:
+        if "type" in message_json and message_json["type"] in ["login", "heartbeat"]:
+            # This is a valid user message that the ADE expects, so don't print warning
+            return packed_message
+        warnings.warn(f"Was unable to find 'message' field in packed message object: '{packed_message}'")
+        return packed_message
+    else:
+        message_type = message_json["type"]
+        if message_type != "user_message":
+            warnings.warn(f"Expected type to be 'user_message', but was '{message_type}', so not unpacking: '{packed_message}'")
+            return packed_message
+        return message_json.get("message")
