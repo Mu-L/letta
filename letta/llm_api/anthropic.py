@@ -19,13 +19,14 @@ from anthropic.types.beta import (
     BetaToolUseBlock,
 )
 
-from letta.errors import BedrockError, BedrockPermissionError
+from letta.errors import BedrockError, BedrockPermissionError, ErrorCode, LLMAuthenticationError, LLMError
 from letta.helpers.datetime_helpers import get_utc_time_int, timestamp_to_datetime
 from letta.llm_api.aws_bedrock import get_bedrock_client
 from letta.llm_api.helpers import add_inner_thoughts_to_functions
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
 from letta.log import get_logger
+from letta.schemas.enums import ProviderCategory
 from letta.schemas.message import Message as _Message
 from letta.schemas.message import MessageRole as _MessageRole
 from letta.schemas.openai.chat_completion_request import ChatCompletionRequest, Tool
@@ -41,6 +42,7 @@ from letta.schemas.openai.chat_completion_response import Message
 from letta.schemas.openai.chat_completion_response import Message as ChoiceMessage
 from letta.schemas.openai.chat_completion_response import MessageDelta, ToolCall, ToolCallDelta, UsageStatistics
 from letta.services.provider_manager import ProviderManager
+from letta.services.user_manager import UserManager
 from letta.settings import model_settings
 from letta.streaming_interface import AgentChunkStreamingInterface, AgentRefreshStreamingInterface
 from letta.tracing import log_event
@@ -114,6 +116,22 @@ MODEL_LIST = [
 
 DUMMY_FIRST_USER_MESSAGE = "User initializing bootup sequence."
 
+VALID_EVENT_TYPES = {"content_block_stop", "message_stop"}
+
+
+def anthropic_check_valid_api_key(api_key: Union[str, None]) -> None:
+    if api_key:
+        anthropic_client = anthropic.Anthropic(api_key=api_key)
+        try:
+            # just use a cheap model to count some tokens - as of 5/7/2025 this is faster than fetching the list of models
+            anthropic_client.messages.count_tokens(model=MODEL_LIST[-1]["name"], messages=[{"role": "user", "content": "a"}])
+        except anthropic.AuthenticationError as e:
+            raise LLMAuthenticationError(message=f"Failed to authenticate with Anthropic: {e}", code=ErrorCode.UNAUTHENTICATED)
+        except Exception as e:
+            raise LLMError(message=f"{e}", code=ErrorCode.INTERNAL_SERVER_ERROR)
+    else:
+        raise ValueError("No API key provided")
+
 
 def antropic_get_model_context_window(url: str, api_key: Union[str, None], model: str) -> int:
     for model_dict in anthropic_get_model_list(url=url, api_key=api_key):
@@ -128,11 +146,12 @@ def anthropic_get_model_list(url: str, api_key: Union[str, None]) -> dict:
     # NOTE: currently there is no GET /models, so we need to hardcode
     # return MODEL_LIST
 
-    anthropic_override_key = ProviderManager().get_anthropic_override_key()
-    if anthropic_override_key:
-        anthropic_client = anthropic.Anthropic(api_key=anthropic_override_key)
+    if api_key:
+        anthropic_client = anthropic.Anthropic(api_key=api_key)
     elif model_settings.anthropic_api_key:
         anthropic_client = anthropic.Anthropic()
+    else:
+        raise ValueError("No API key provided")
 
     models = anthropic_client.models.list()
     models_json = models.model_dump()
@@ -594,7 +613,8 @@ def convert_anthropic_stream_event_to_chatcompletion(
             redacted_reasoning_content = event.content_block.data
         else:
             warnings.warn("Unexpected content start type: " + str(type(event.content_block)))
-
+    elif event.type in VALID_EVENT_TYPES:
+        pass
     else:
         warnings.warn("Unexpected event type: " + event.type)
 
@@ -738,13 +758,17 @@ def anthropic_chat_completions_request(
     put_inner_thoughts_in_kwargs: bool = False,
     extended_thinking: bool = False,
     max_reasoning_tokens: Optional[int] = None,
+    provider_name: Optional[str] = None,
+    provider_category: Optional[ProviderCategory] = None,
     betas: List[str] = ["tools-2024-04-04"],
+    user_id: Optional[str] = None,
 ) -> ChatCompletionResponse:
     """https://docs.anthropic.com/claude/docs/tool-use"""
     anthropic_client = None
-    anthropic_override_key = ProviderManager().get_anthropic_override_key()
-    if anthropic_override_key:
-        anthropic_client = anthropic.Anthropic(api_key=anthropic_override_key)
+    if provider_category == ProviderCategory.byok:
+        actor = UserManager().get_user_or_default(user_id=user_id)
+        api_key = ProviderManager().get_override_key(provider_name, actor=actor)
+        anthropic_client = anthropic.Anthropic(api_key=api_key)
     elif model_settings.anthropic_api_key:
         anthropic_client = anthropic.Anthropic()
     else:
@@ -796,7 +820,10 @@ def anthropic_chat_completions_request_stream(
     put_inner_thoughts_in_kwargs: bool = False,
     extended_thinking: bool = False,
     max_reasoning_tokens: Optional[int] = None,
+    provider_name: Optional[str] = None,
+    provider_category: Optional[ProviderCategory] = None,
     betas: List[str] = ["tools-2024-04-04"],
+    user_id: Optional[str] = None,
 ) -> Generator[ChatCompletionChunkResponse, None, None]:
     """Stream chat completions from Anthropic API.
 
@@ -810,10 +837,10 @@ def anthropic_chat_completions_request_stream(
         extended_thinking=extended_thinking,
         max_reasoning_tokens=max_reasoning_tokens,
     )
-
-    anthropic_override_key = ProviderManager().get_anthropic_override_key()
-    if anthropic_override_key:
-        anthropic_client = anthropic.Anthropic(api_key=anthropic_override_key)
+    if provider_category == ProviderCategory.byok:
+        actor = UserManager().get_user_or_default(user_id=user_id)
+        api_key = ProviderManager().get_override_key(provider_name, actor=actor)
+        anthropic_client = anthropic.Anthropic(api_key=api_key)
     elif model_settings.anthropic_api_key:
         anthropic_client = anthropic.Anthropic()
 
@@ -860,10 +887,13 @@ def anthropic_chat_completions_process_stream(
     put_inner_thoughts_in_kwargs: bool = False,
     extended_thinking: bool = False,
     max_reasoning_tokens: Optional[int] = None,
+    provider_name: Optional[str] = None,
+    provider_category: Optional[ProviderCategory] = None,
     create_message_id: bool = True,
     create_message_datetime: bool = True,
     betas: List[str] = ["tools-2024-04-04"],
     name: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> ChatCompletionResponse:
     """Process a streaming completion response from Anthropic, similar to OpenAI's streaming.
 
@@ -944,7 +974,10 @@ def anthropic_chat_completions_process_stream(
                 put_inner_thoughts_in_kwargs=put_inner_thoughts_in_kwargs,
                 extended_thinking=extended_thinking,
                 max_reasoning_tokens=max_reasoning_tokens,
+                provider_name=provider_name,
+                provider_category=provider_category,
                 betas=betas,
+                user_id=user_id,
             )
         ):
             assert isinstance(chat_completion_chunk, ChatCompletionChunkResponse), type(chat_completion_chunk)

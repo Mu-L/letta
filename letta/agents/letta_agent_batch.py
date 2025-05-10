@@ -66,7 +66,7 @@ class _ResumeContext:
     request_status_updates: List[RequestStatusUpdateInfo]
 
 
-async def execute_tool_wrapper(params: ToolExecutionParams):
+async def execute_tool_wrapper(params: ToolExecutionParams) -> Tuple[str, Tuple[str, bool]]:
     """
     Executes the tool in an out‑of‑process worker and returns:
         (agent_id, (tool_result:str, success_flag:bool))
@@ -137,27 +137,44 @@ class LettaAgentBatch:
         log_event(name="load_and_prepare_agents")
         agent_messages_mapping: Dict[str, List[Message]] = {}
         agent_tools_mapping: Dict[str, List[dict]] = {}
+        # TODO: This isn't optimal, moving fast - prone to bugs because we pass around this half formed pydantic object
+        agent_batch_item_mapping: Dict[str, LLMBatchItem] = {}
         agent_states = []
         for batch_request in batch_requests:
             agent_id = batch_request.agent_id
             agent_state = self.agent_manager.get_agent_by_id(agent_id, actor=self.actor)
             agent_states.append(agent_state)
 
-            agent_messages_mapping[agent_id] = self._get_in_context_messages_per_agent(
-                agent_state=agent_state, input_messages=batch_request.messages
-            )
-
             if agent_id not in agent_step_state_mapping:
                 agent_step_state_mapping[agent_id] = AgentStepState(
                     step_number=0, tool_rules_solver=ToolRulesSolver(tool_rules=agent_state.tool_rules)
                 )
 
+            llm_batch_item = LLMBatchItem(
+                llm_batch_id="",  # TODO: This is hacky, it gets filled in later
+                agent_id=agent_state.id,
+                llm_config=agent_state.llm_config,
+                request_status=JobStatus.created,
+                step_status=AgentStepStatus.paused,
+                step_state=agent_step_state_mapping[agent_id],
+            )
+            agent_batch_item_mapping[agent_id] = llm_batch_item
+
+            # Fill in the batch_item_id for the message
+            for msg in batch_request.messages:
+                msg.batch_item_id = llm_batch_item.id
+
+            agent_messages_mapping[agent_id] = self._prepare_in_context_messages_per_agent(
+                agent_state=agent_state, input_messages=batch_request.messages
+            )
+
             agent_tools_mapping[agent_id] = self._prepare_tools_per_agent(agent_state, agent_step_state_mapping[agent_id].tool_rules_solver)
 
         log_event(name="init_llm_client")
         llm_client = LLMClient.create(
-            provider=agent_states[0].llm_config.model_endpoint_type,
+            provider_type=agent_states[0].llm_config.model_endpoint_type,
             put_inner_thoughts_first=True,
+            actor=self.actor,
         )
         agent_llm_config_mapping = {s.id: s.llm_config for s in agent_states}
 
@@ -180,21 +197,14 @@ class LettaAgentBatch:
         log_event(name="prepare_batch_items")
         batch_items = []
         for state in agent_states:
-            step_state = agent_step_state_mapping[state.id]
-            batch_items.append(
-                LLMBatchItem(
-                    llm_batch_id=llm_batch_job.id,
-                    agent_id=state.id,
-                    llm_config=state.llm_config,
-                    request_status=JobStatus.created,
-                    step_status=AgentStepStatus.paused,
-                    step_state=step_state,
-                )
-            )
+            llm_batch_item = agent_batch_item_mapping[state.id]
+            # TODO This is hacky
+            llm_batch_item.llm_batch_id = llm_batch_job.id
+            batch_items.append(llm_batch_item)
 
         if batch_items:
             log_event(name="bulk_create_batch_items")
-            self.batch_manager.create_llm_batch_items_bulk(batch_items, actor=self.actor)
+            batch_items_persisted = self.batch_manager.create_llm_batch_items_bulk(batch_items, actor=self.actor)
 
         log_event(name="return_batch_response")
         return LettaBatchResponse(
@@ -273,8 +283,9 @@ class LettaAgentBatch:
 
             # translate provider‑specific response → OpenAI‑style tool call (unchanged)
             llm_client = LLMClient.create(
-                provider=item.llm_config.model_endpoint_type,
+                provider_type=item.llm_config.model_endpoint_type,
                 put_inner_thoughts_first=True,
+                actor=self.actor,
             )
             tool_call = (
                 llm_client.convert_response_to_chat_completion(
@@ -311,8 +322,13 @@ class LettaAgentBatch:
     @trace_method
     async def _execute_tools(self, ctx: _ResumeContext) -> Sequence[Tuple[str, Tuple[str, bool]]]:
         sbx_cfg, sbx_env = self._build_sandbox()
-        params = [
-            ToolExecutionParams(
+        rethink_memory_tool_name = "rethink_memory"
+        tool_params = []
+        # TODO: This is a special case - we need to think about how to generalize this
+        # TODO: Rethink memory is a common op that is easily batchable, so we pull this logic out
+        rethink_memory_params = []
+        for aid in ctx.agent_ids:
+            param = ToolExecutionParams(
                 agent_id=aid,
                 tool_call_name=ctx.tool_call_name_map[aid],
                 tool_args=ctx.tool_call_args_map[aid],
@@ -321,19 +337,58 @@ class LettaAgentBatch:
                 sbx_config=sbx_cfg,
                 sbx_env_vars=sbx_env,
             )
-            for aid in ctx.agent_ids
-        ]
-        async with Pool() as pool:
-            return await pool.map(execute_tool_wrapper, params)
+
+            if ctx.tool_call_name_map[aid] == rethink_memory_tool_name:
+                rethink_memory_params.append(param)
+            else:
+                tool_params.append(param)
+
+        if rethink_memory_params:
+            return self._bulk_rethink_memory(rethink_memory_params)
+
+        if tool_params:
+            async with Pool() as pool:
+                return await pool.map(execute_tool_wrapper, tool_params)
+
+    @trace_method
+    def _bulk_rethink_memory(self, params: List[ToolExecutionParams]) -> Sequence[Tuple[str, Tuple[str, bool]]]:
+        updates = {}
+        result = []
+        for param in params:
+            # Sanity check
+            # TODO: This is very brittle and done quickly for performance
+            # TODO: If the end tool is changed, this will break
+            # TODO: Move 'rethink_memory' to a native Letta tool that we control
+            if "new_memory" not in param.tool_args or "target_block_label" not in param.tool_args:
+                raise ValueError(f"Missing either `new_memory` or `target_block_label` in the tool args: {param.tool_args}")
+
+            # Find the block id/update
+            block_id = param.agent_state.memory.get_block(label=param.tool_args.get("target_block_label")).id
+            new_value = param.tool_args.get("new_memory")
+
+            # This is sensitive to multiple agents overwriting the same memory block
+            updates[block_id] = new_value
+
+            # TODO: This is quite ugly and confusing - this is mostly to align with the returns of other tools
+            result.append((param.agent_id, ("", True)))
+
+        self.block_manager.bulk_update_block_values(updates=updates, actor=self.actor)
+
+        return result
 
     def _persist_tool_messages(
         self,
         exec_results: Sequence[Tuple[str, Tuple[str, bool]]],
         ctx: _ResumeContext,
     ) -> Dict[str, List[Message]]:
+        # TODO: This is redundant, we should have this ready on the ctx
+        # TODO: I am doing it quick and dirty for now
+        agent_item_map: Dict[str, LLMBatchItem] = {item.agent_id: item for item in ctx.batch_items}
+
         msg_map: Dict[str, List[Message]] = {}
         for aid, (tool_res, success) in exec_results:
             msgs = self._create_tool_call_messages(
+                llm_batch_item_id=agent_item_map[aid].id,
                 agent_state=ctx.agent_state_map[aid],
                 tool_call_name=ctx.tool_call_name_map[aid],
                 tool_call_args=ctx.tool_call_args_map[aid],
@@ -395,6 +450,7 @@ class LettaAgentBatch:
 
     def _create_tool_call_messages(
         self,
+        llm_batch_item_id: str,
         agent_state: AgentState,
         tool_call_name: str,
         tool_call_args: Dict[str, Any],
@@ -417,6 +473,7 @@ class LettaAgentBatch:
             reasoning_content=reasoning_content,
             pre_computed_assistant_message_id=None,
             pre_computed_tool_message_id=None,
+            llm_batch_item_id=llm_batch_item_id,
         )
 
         return tool_call_messages
@@ -473,7 +530,7 @@ class LettaAgentBatch:
         valid_tool_names = tool_rules_solver.get_allowed_tool_names(available_tools=set([t.name for t in tools]))
         return [enable_strict_mode(t.json_schema) for t in tools if t.name in set(valid_tool_names)]
 
-    def _get_in_context_messages_per_agent(self, agent_state: AgentState, input_messages: List[MessageCreate]) -> List[Message]:
+    def _prepare_in_context_messages_per_agent(self, agent_state: AgentState, input_messages: List[MessageCreate]) -> List[Message]:
         current_in_context_messages, new_in_context_messages = _prepare_in_context_messages(
             input_messages, agent_state, self.message_manager, self.actor
         )

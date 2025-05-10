@@ -1,4 +1,6 @@
 import os
+import random
+import string
 import time
 from datetime import datetime, timezone
 from importlib import util
@@ -175,3 +177,25 @@ def wait_for_incoming_message(
         time.sleep(sleep_interval)
 
     return False
+
+
+def wait_for_server(url, timeout=30, interval=0.5):
+    """Wait for server to become available by polling the given URL."""
+    import requests
+    from requests.exceptions import ConnectionError
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f"{url}/v1/health", timeout=2)
+            if response.status_code == 200:
+                return True
+        except (ConnectionError, requests.Timeout):
+            pass
+        time.sleep(interval)
+
+    raise TimeoutError(f"Server at {url} did not start within {timeout} seconds")
+
+
+def random_string(length: int) -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length))

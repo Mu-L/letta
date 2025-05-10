@@ -1031,7 +1031,7 @@ class RESTClient(AbstractClient):
             #     messages = []
             #     for m in response.messages:
             #         assert isinstance(m, Message)
-            #         messages += m.to_letta_message()
+            #         messages += m.to_letta_messages()
             #     response.messages = messages
 
             return response
@@ -2725,14 +2725,14 @@ class LocalClient(AbstractClient):
         #    assert isinstance(m, Message), f"Expected Message object, got {type(m)}"
         # letta_messages = []
         # for m in messages:
-        #    letta_messages += m.to_letta_message()
+        #    letta_messages += m.to_letta_messages()
         # return LettaResponse(messages=letta_messages, usage=usage)
 
         # format messages
         messages = self.interface.to_list()
         letta_messages = []
         for m in messages:
-            letta_messages += m.to_letta_message()
+            letta_messages += m.to_letta_messages()
 
         return LettaResponse(messages=letta_messages, usage=usage)
 
@@ -3455,7 +3455,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[LLMConfig]): List of LLM configurations
         """
-        return self.server.list_llm_models()
+        return self.server.list_llm_models(actor=self.user)
 
     def list_embedding_configs(self) -> List[EmbeddingConfig]:
         """
@@ -3464,7 +3464,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[EmbeddingConfig]): List of embedding configurations
         """
-        return self.server.list_embedding_models()
+        return self.server.list_embedding_models(actor=self.user)
 
     def create_org(self, name: Optional[str] = None) -> Organization:
         return self.server.organization_manager.create_organization(pydantic_org=Organization(name=name))

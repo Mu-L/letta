@@ -3,7 +3,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from marshmallow import ValidationError
 from orjson import orjson
@@ -13,6 +13,7 @@ from starlette.responses import Response, StreamingResponse
 
 from letta.agents.letta_agent import LettaAgent
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.helpers.datetime_helpers import get_utc_timestamp_ns
 from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
@@ -618,6 +619,7 @@ def modify_message(
 )
 async def send_message(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -629,14 +631,12 @@ async def send_message(
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
     # TODO: This is redundant, remove soon
     agent = server.agent_manager.get_agent_by_id(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("x-experimental")
+    feature_enabled = settings.use_experimental or experimental_header
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai", "google_vertex", "google_ai"]
 
-    if (
-        agent.llm_config.model_endpoint_type == "anthropic"
-        and not agent.enable_sleeptime
-        and not agent.multi_agent_group
-        and not agent.agent_type == AgentType.sleeptime_agent
-        and settings.use_experimental
-    ):
+    if agent_eligible and feature_enabled and model_compatible:
         experimental_agent = LettaAgent(
             agent_id=agent_id,
             message_manager=server.message_manager,
@@ -669,34 +669,32 @@ async def send_message(
     responses={
         200: {
             "description": "Successful response",
-            "content": {
-                "text/event-stream": {"description": "Server-Sent Events stream"},
-            },
+            "content": {"text/event-stream": {}},
         }
     },
 )
 async def send_message_streaming(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaStreamingRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
-):
+) -> StreamingResponse | LettaResponse:
     """
     Process a user message and return the agent's response.
     This endpoint accepts a message from a user and processes it through the agent.
     It will stream the steps of the response always, and stream the tokens if 'stream_tokens' is set to True.
     """
+    request_start_timestamp_ns = get_utc_timestamp_ns()
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
     # TODO: This is redundant, remove soon
     agent = server.agent_manager.get_agent_by_id(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("x-experimental")
+    feature_enabled = settings.use_experimental or experimental_header
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai"]
 
-    if (
-        agent.llm_config.model_endpoint_type == "anthropic"
-        and not agent.enable_sleeptime
-        and not agent.multi_agent_group
-        and not agent.agent_type == AgentType.sleeptime_agent
-        and settings.use_experimental
-    ):
+    if agent_eligible and feature_enabled and model_compatible:
         experimental_agent = LettaAgent(
             agent_id=agent_id,
             message_manager=server.message_manager,
@@ -721,6 +719,7 @@ async def send_message_streaming(
             use_assistant_message=request.use_assistant_message,
             assistant_message_tool_name=request.assistant_message_tool_name,
             assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
+            request_start_timestamp_ns=request_start_timestamp_ns,
         )
 
     return result

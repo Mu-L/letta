@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import re
@@ -20,6 +21,8 @@ from letta.constants import (
     BASE_MEMORY_TOOLS,
     BASE_SLEEPTIME_TOOLS,
     BASE_TOOLS,
+    BASE_VOICE_SLEEPTIME_CHAT_TOOLS,
+    BASE_VOICE_SLEEPTIME_TOOLS,
     LETTA_TOOL_EXECUTION_DIR,
     MCP_TOOL_TAG_NAME_PREFIX,
     MULTI_AGENT_TOOLS,
@@ -71,6 +74,7 @@ from letta.services.block_manager import BlockManager
 from letta.services.organization_manager import OrganizationManager
 from letta.settings import tool_settings
 from tests.helpers.utils import comprehensive_agent_checks
+from tests.utils import random_string
 
 DEFAULT_EMBEDDING_CONFIG = EmbeddingConfig(
     embedding_endpoint_type="hugging-face",
@@ -2229,6 +2233,12 @@ def test_update_tool_by_id(server: SyncServer, print_tool, default_user):
     # Assertions to check if the update was successful
     assert updated_tool.description == updated_description
     assert updated_tool.return_char_limit == return_char_limit
+    assert updated_tool.tool_type == ToolType.CUSTOM
+
+    # Dangerous: we bypass safety to give it another tool type
+    server.tool_manager.update_tool_by_id(print_tool.id, tool_update, actor=default_user, updated_tool_type=ToolType.EXTERNAL_LANGCHAIN)
+    updated_tool = server.tool_manager.get_tool_by_id(print_tool.id, actor=default_user)
+    assert updated_tool.tool_type == ToolType.EXTERNAL_LANGCHAIN
 
 
 def test_update_tool_source_code_refreshes_schema_and_name(server: SyncServer, print_tool, default_user):
@@ -2334,7 +2344,16 @@ def test_delete_tool_by_id(server: SyncServer, print_tool, default_user):
 
 def test_upsert_base_tools(server: SyncServer, default_user):
     tools = server.tool_manager.upsert_base_tools(actor=default_user)
-    expected_tool_names = sorted(set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS))
+    expected_tool_names = sorted(
+        set(
+            BASE_TOOLS
+            + BASE_MEMORY_TOOLS
+            + MULTI_AGENT_TOOLS
+            + BASE_SLEEPTIME_TOOLS
+            + BASE_VOICE_SLEEPTIME_TOOLS
+            + BASE_VOICE_SLEEPTIME_CHAT_TOOLS
+        )
+    )
     assert sorted([t.name for t in tools]) == expected_tool_names
 
     # Call it again to make sure it doesn't create duplicates
@@ -2351,6 +2370,10 @@ def test_upsert_base_tools(server: SyncServer, default_user):
             assert t.tool_type == ToolType.LETTA_MULTI_AGENT_CORE
         elif t.name in BASE_SLEEPTIME_TOOLS:
             assert t.tool_type == ToolType.LETTA_SLEEPTIME_CORE
+        elif t.name in BASE_VOICE_SLEEPTIME_TOOLS:
+            assert t.tool_type == ToolType.LETTA_VOICE_SLEEPTIME_CORE
+        elif t.name in BASE_VOICE_SLEEPTIME_CHAT_TOOLS:
+            assert t.tool_type == ToolType.LETTA_VOICE_SLEEPTIME_CORE
         else:
             pytest.fail(f"The tool name is unrecognized as a base tool: {t.name}")
         assert t.source_code is None
@@ -2776,6 +2799,88 @@ def test_batch_create_multiple_blocks(server: SyncServer, default_user):
     all_labels = {blk.label for blk in block_manager.get_blocks(actor=default_user)}
     expected_labels = {f"batch_label_{i}" for i in range(num_blocks)}
     assert expected_labels.issubset(all_labels)
+
+
+def test_bulk_update_skips_missing_and_truncates_then_returns_none(server: SyncServer, default_user: PydanticUser, caplog):
+    mgr = BlockManager()
+
+    # create one block with a small limit
+    b = mgr.create_or_update_block(
+        PydanticBlock(label="human", value="orig", limit=5),
+        actor=default_user,
+    )
+
+    # prepare updates: one real id with an over‐limit value, plus one missing id
+    long_val = random_string(10)  # length > limit==5
+    updates = {
+        b.id: long_val,
+        "nonexistent-id": "whatever",
+    }
+
+    caplog.set_level(logging.WARNING)
+    result = mgr.bulk_update_block_values(updates, actor=default_user)
+    # default return_hydrated=False → should be None
+    assert result is None
+
+    # warnings should mention skipping the missing ID and truncation
+    assert "skipping during bulk update" in caplog.text
+    assert "truncating" in caplog.text
+
+    # confirm the value was truncated to `limit` characters
+    reloaded = mgr.get_blocks(actor=default_user, id=b.id)[0]
+    assert len(reloaded.value) == 5
+    assert reloaded.value == long_val[:5]
+
+
+def test_bulk_update_return_hydrated_true(server: SyncServer, default_user: PydanticUser):
+    mgr = BlockManager()
+
+    # create a block
+    b = mgr.create_or_update_block(
+        PydanticBlock(label="persona", value="foo", limit=20),
+        actor=default_user,
+    )
+
+    updates = {b.id: "new-val"}
+    updated = mgr.bulk_update_block_values(updates, actor=default_user, return_hydrated=True)
+
+    # with return_hydrated=True, we get back a list of schemas
+    assert isinstance(updated, list) and len(updated) == 1
+    assert updated[0].id == b.id
+    assert updated[0].value == "new-val"
+
+
+def test_bulk_update_respects_org_scoping(server: SyncServer, default_user: PydanticUser, other_user_different_org: PydanticUser, caplog):
+    mgr = BlockManager()
+
+    # one block in each org
+    mine = mgr.create_or_update_block(
+        PydanticBlock(label="human", value="mine", limit=100),
+        actor=default_user,
+    )
+    theirs = mgr.create_or_update_block(
+        PydanticBlock(label="human", value="theirs", limit=100),
+        actor=other_user_different_org,
+    )
+
+    updates = {
+        mine.id: "updated-mine",
+        theirs.id: "updated-theirs",
+    }
+
+    caplog.set_level(logging.WARNING)
+    mgr.bulk_update_block_values(updates, actor=default_user)
+
+    # mine should be updated...
+    reloaded_mine = mgr.get_blocks(actor=default_user, id=mine.id)[0]
+    assert reloaded_mine.value == "updated-mine"
+
+    # ...theirs should remain untouched
+    reloaded_theirs = mgr.get_blocks(actor=other_user_different_org, id=theirs.id)[0]
+    assert reloaded_theirs.value == "theirs"
+
+    # warning should mention skipping the other-org ID
+    assert "skipping during bulk update" in caplog.text
 
 
 # ======================================================================================================================
@@ -3892,7 +3997,7 @@ def test_create_local_sandbox_config_defaults(server: SyncServer, default_user):
     # Assertions
     assert created_config.type == SandboxType.LOCAL
     assert created_config.get_local_config() == sandbox_config_create.config
-    assert created_config.get_local_config().sandbox_dir in {LETTA_TOOL_EXECUTION_DIR, tool_settings.local_sandbox_dir}
+    assert created_config.get_local_config().sandbox_dir in {LETTA_TOOL_EXECUTION_DIR, tool_settings.tool_exec_dir}
     assert created_config.organization_id == default_user.organization_id
 
 

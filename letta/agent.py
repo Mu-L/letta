@@ -21,14 +21,14 @@ from letta.constants import (
 )
 from letta.errors import ContextWindowExceededError
 from letta.functions.ast_parsers import coerce_dict_args_by_annotations, get_function_annotations_from_source
+from letta.functions.composio_helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.functions.functions import get_function_from_module
-from letta.functions.helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.functions.mcp_client.base_client import BaseMCPClient
 from letta.helpers import ToolRulesSolver
 from letta.helpers.composio_helpers import get_composio_api_key
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.helpers.json_helpers import json_dumps, json_loads
-from letta.helpers.message_helper import prepare_input_message_create
+from letta.helpers.message_helper import convert_message_creates_to_messages
 from letta.interface import AgentInterface
 from letta.llm_api.helpers import calculate_summarizer_cutoff, get_token_counts_for_messages, is_context_overflow_error
 from letta.llm_api.llm_api_tools import create
@@ -331,8 +331,9 @@ class Agent(BaseAgent):
                 log_telemetry(self.logger, "_get_ai_reply create start")
                 # New LLM client flow
                 llm_client = LLMClient.create(
-                    provider=self.agent_state.llm_config.model_endpoint_type,
+                    provider_type=self.agent_state.llm_config.model_endpoint_type,
                     put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=self.user,
                 )
 
                 if llm_client and not stream:
@@ -726,8 +727,7 @@ class Agent(BaseAgent):
         self.tool_rules_solver.clear_tool_history()
 
         # Convert MessageCreate objects to Message objects
-        message_objects = [prepare_input_message_create(m, self.agent_state.id, True, True) for m in input_messages]
-        next_input_messages = message_objects
+        next_input_messages = convert_message_creates_to_messages(input_messages, self.agent_state.id)
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
@@ -942,11 +942,9 @@ class Agent(BaseAgent):
                 model_endpoint=self.agent_state.llm_config.model_endpoint,
                 context_window_limit=self.agent_state.llm_config.context_window,
                 usage=response.usage,
-                # TODO(@caren): Add full provider support - this line is a workaround for v0 BYOK feature
-                provider_id=(
-                    self.provider_manager.get_anthropic_override_provider_id()
-                    if self.agent_state.llm_config.model_endpoint_type == "anthropic"
-                    else None
+                provider_id=self.provider_manager.get_provider_id_from_name(
+                    self.agent_state.llm_config.provider_name,
+                    actor=self.user,
                 ),
                 job_id=job_id,
             )
@@ -1091,7 +1089,9 @@ class Agent(BaseAgent):
                 LLM_MAX_TOKENS[self.model] if (self.model is not None and self.model in LLM_MAX_TOKENS) else LLM_MAX_TOKENS["DEFAULT"]
             )
 
-        summary = summarize_messages(agent_state=self.agent_state, message_sequence_to_summarize=message_sequence_to_summarize)
+        summary = summarize_messages(
+            agent_state=self.agent_state, message_sequence_to_summarize=message_sequence_to_summarize, actor=self.user
+        )
         logger.info(f"Got summary: {summary}")
 
         # Metadata that's useful for the agent to see
@@ -1103,7 +1103,7 @@ class Agent(BaseAgent):
         logger.info(f"Packaged into message: {summary_message}")
 
         prior_len = len(in_context_messages_openai)
-        self.agent_state = self.agent_manager.trim_all_in_context_messages_except_system(agent_id=self.agent_state.id, actor=self.user)
+        self.agent_state = self.agent_manager.trim_older_in_context_messages(num=cutoff, agent_id=self.agent_state.id, actor=self.user)
         packed_summary_message = {"role": "user", "content": summary_message}
         # Prepend the summary
         self.agent_state = self.agent_manager.prepend_to_in_context_messages(

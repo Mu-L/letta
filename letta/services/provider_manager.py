@@ -1,8 +1,9 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from letta.orm.provider import Provider as ProviderModel
+from letta.schemas.enums import ProviderCategory, ProviderType
 from letta.schemas.providers import Provider as PydanticProvider
-from letta.schemas.providers import ProviderUpdate
+from letta.schemas.providers import ProviderCheck, ProviderCreate, ProviderUpdate
 from letta.schemas.user import User as PydanticUser
 from letta.utils import enforce_types
 
@@ -15,9 +16,15 @@ class ProviderManager:
         self.session_maker = db_context
 
     @enforce_types
-    def create_provider(self, provider: PydanticProvider, actor: PydanticUser) -> PydanticProvider:
+    def create_provider(self, request: ProviderCreate, actor: PydanticUser) -> PydanticProvider:
         """Create a new provider if it doesn't already exist."""
         with self.session_maker() as session:
+            provider_create_args = {**request.model_dump(), "provider_category": ProviderCategory.byok}
+            provider = PydanticProvider(**provider_create_args)
+
+            if provider.name == provider.provider_type.value:
+                raise ValueError("Provider name must be unique and different from provider type")
+
             # Assign the organization id based on the actor
             provider.organization_id = actor.organization_id
 
@@ -59,29 +66,51 @@ class ProviderManager:
             session.commit()
 
     @enforce_types
-    def list_providers(self, after: Optional[str] = None, limit: Optional[int] = 50, actor: PydanticUser = None) -> List[PydanticProvider]:
+    def list_providers(
+        self,
+        actor: PydanticUser,
+        name: Optional[str] = None,
+        provider_type: Optional[ProviderType] = None,
+        after: Optional[str] = None,
+        limit: Optional[int] = 50,
+    ) -> List[PydanticProvider]:
         """List all providers with optional pagination."""
+        filter_kwargs = {}
+        if name:
+            filter_kwargs["name"] = name
+        if provider_type:
+            filter_kwargs["provider_type"] = provider_type
         with self.session_maker() as session:
             providers = ProviderModel.list(
                 db_session=session,
                 after=after,
                 limit=limit,
                 actor=actor,
+                **filter_kwargs,
             )
             return [provider.to_pydantic() for provider in providers]
 
     @enforce_types
-    def get_anthropic_override_provider_id(self) -> Optional[str]:
-        """Helper function to fetch custom anthropic provider id for v0 BYOK feature"""
-        anthropic_provider = [provider for provider in self.list_providers() if provider.name == "anthropic"]
-        if len(anthropic_provider) != 0:
-            return anthropic_provider[0].id
-        return None
+    def get_provider_id_from_name(self, provider_name: Union[str, None], actor: PydanticUser) -> Optional[str]:
+        providers = self.list_providers(name=provider_name, actor=actor)
+        return providers[0].id if providers else None
 
     @enforce_types
-    def get_anthropic_override_key(self) -> Optional[str]:
-        """Helper function to fetch custom anthropic key for v0 BYOK feature"""
-        anthropic_provider = [provider for provider in self.list_providers() if provider.name == "anthropic"]
-        if len(anthropic_provider) != 0:
-            return anthropic_provider[0].api_key
-        return None
+    def get_override_key(self, provider_name: Union[str, None], actor: PydanticUser) -> Optional[str]:
+        providers = self.list_providers(name=provider_name, actor=actor)
+        return providers[0].api_key if providers else None
+
+    @enforce_types
+    def check_provider_api_key(self, provider_check: ProviderCheck) -> None:
+        provider = PydanticProvider(
+            name=provider_check.provider_type.value,
+            provider_type=provider_check.provider_type,
+            api_key=provider_check.api_key,
+            provider_category=ProviderCategory.byok,
+        ).cast_to_subtype()
+
+        # TODO: add more string sanity checks here before we hit actual endpoints
+        if not provider.api_key:
+            raise ValueError("API key is required")
+
+        provider.check_api_key()
