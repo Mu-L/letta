@@ -21,14 +21,14 @@ from letta.constants import (
 )
 from letta.errors import ContextWindowExceededError
 from letta.functions.ast_parsers import coerce_dict_args_by_annotations, get_function_annotations_from_source
+from letta.functions.composio_helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.functions.functions import get_function_from_module
-from letta.functions.helpers import execute_composio_action, generate_composio_action_from_func_name
 from letta.functions.mcp_client.base_client import BaseMCPClient
 from letta.helpers import ToolRulesSolver
 from letta.helpers.composio_helpers import get_composio_api_key
 from letta.helpers.datetime_helpers import get_utc_time
 from letta.helpers.json_helpers import json_dumps, json_loads
-from letta.helpers.message_helper import prepare_input_message_create
+from letta.helpers.message_helper import convert_message_creates_to_messages
 from letta.interface import AgentInterface
 from letta.llm_api.helpers import calculate_summarizer_cutoff, get_token_counts_for_messages, is_context_overflow_error
 from letta.llm_api.llm_api_tools import create
@@ -133,7 +133,6 @@ class Agent(BaseAgent):
         # Different interfaces can handle events differently
         # e.g., print in CLI vs send a discord message with a discord bot
         self.interface = interface
-        self.chunk_index = 0
 
         # Create the persistence manager object based on the AgentState info
         self.message_manager = MessageManager()
@@ -179,6 +178,15 @@ class Agent(BaseAgent):
                 except (json.JSONDecodeError, KeyError):
                     raise ValueError(f"Invalid JSON format in message: {text_content}")
         return None
+
+    def ensure_read_only_block_not_modified(self, new_memory: Memory) -> None:
+        """
+        Throw an error if a read-only block has been modified
+        """
+        for label in self.agent_state.memory.list_block_labels():
+            if self.agent_state.memory.get_block(label).read_only:
+                if new_memory.get_block(label).value != self.agent_state.memory.get_block(label).value:
+                    raise ValueError(READ_ONLY_BLOCK_EDIT_ERROR)
 
     def update_memory_if_changed(self, new_memory: Memory) -> bool:
         """
@@ -248,11 +256,9 @@ class Agent(BaseAgent):
             group_id=group_id,
         )
         messages.append(new_message)
-        self.interface.function_message(f"Error: {error_msg}", msg_obj=new_message, chunk_index=self.chunk_index)
-        self.chunk_index += 1
+        self.interface.function_message(f"Error: {error_msg}", msg_obj=new_message, chunk_index=0)
         if include_function_failed_message:
-            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=new_message, chunk_index=self.chunk_index)
-            self.chunk_index += 1
+            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=new_message)
 
         # Return updated messages
         return messages
@@ -331,8 +337,9 @@ class Agent(BaseAgent):
                 log_telemetry(self.logger, "_get_ai_reply create start")
                 # New LLM client flow
                 llm_client = LLMClient.create(
-                    provider=self.agent_state.llm_config.model_endpoint_type,
+                    provider_type=self.agent_state.llm_config.model_endpoint_type,
                     put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=self.user,
                 )
 
                 if llm_client and not stream:
@@ -421,6 +428,7 @@ class Agent(BaseAgent):
         messages = []  # append these to the history when done
         function_name = None
         function_args = {}
+        chunk_index = 0
 
         # Step 2: check if LLM wanted to call a function
         if response_message.function_call or (response_message.tool_calls is not None and len(response_message.tool_calls) > 0):
@@ -464,8 +472,8 @@ class Agent(BaseAgent):
             nonnull_content = False
             if response_message.content or response_message.reasoning_content or response_message.redacted_reasoning_content:
                 # The content if then internal monologue, not chat
-                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
-                self.chunk_index += 1
+                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=chunk_index)
+                chunk_index += 1
                 # Flag to avoid printing a duplicate if inner thoughts get popped from the function call
                 nonnull_content = True
 
@@ -514,8 +522,8 @@ class Agent(BaseAgent):
                 response_message.content = function_args.pop("inner_thoughts")
             # The content if then internal monologue, not chat
             if response_message.content and not nonnull_content:
-                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
-                self.chunk_index += 1
+                self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=chunk_index)
+                chunk_index += 1
 
             # (Still parsing function args)
             # Handle requests for immediate heartbeat
@@ -541,8 +549,8 @@ class Agent(BaseAgent):
             # handle cases where we return a json message
             if "message" in function_args:
                 function_args["message"] = str(function_args.get("message", ""))
-            self.interface.function_message(f"Running {function_name}({function_args})", msg_obj=messages[-1], chunk_index=self.chunk_index)
-            self.chunk_index += 1
+            self.interface.function_message(f"Running {function_name}({function_args})", msg_obj=messages[-1], chunk_index=chunk_index)
+            chunk_index = 0  # reset chunk index after assistant message
             try:
                 # handle tool execution (sandbox) and state updates
                 log_telemetry(
@@ -666,10 +674,9 @@ class Agent(BaseAgent):
                     group_id=group_id,
                 )
             )  # extend conversation with function response
-            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1], chunk_index=self.chunk_index)
-            self.chunk_index += 1
-            self.interface.function_message(f"Success: {function_response_string}", msg_obj=messages[-1], chunk_index=self.chunk_index)
-            self.chunk_index += 1
+            self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1], chunk_index=chunk_index)
+            self.interface.function_message(f"Success: {function_response_string}", msg_obj=messages[-1], chunk_index=chunk_index)
+            chunk_index += 1
             self.last_function_response = function_response
 
         else:
@@ -684,8 +691,8 @@ class Agent(BaseAgent):
                     group_id=group_id,
                 )
             )  # extend conversation with assistant's reply
-            self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=self.chunk_index)
-            self.chunk_index += 1
+            self.interface.internal_monologue(response_message.content, msg_obj=messages[-1], chunk_index=chunk_index)
+            chunk_index += 1
             heartbeat_request = False
             function_failed = False
 
@@ -726,8 +733,7 @@ class Agent(BaseAgent):
         self.tool_rules_solver.clear_tool_history()
 
         # Convert MessageCreate objects to Message objects
-        message_objects = [prepare_input_message_create(m, self.agent_state.id, True, True) for m in input_messages]
-        next_input_messages = message_objects
+        next_input_messages = convert_message_creates_to_messages(input_messages, self.agent_state.id)
         counter = 0
         total_usage = UsageStatistics()
         step_count = 0
@@ -942,11 +948,9 @@ class Agent(BaseAgent):
                 model_endpoint=self.agent_state.llm_config.model_endpoint,
                 context_window_limit=self.agent_state.llm_config.context_window,
                 usage=response.usage,
-                # TODO(@caren): Add full provider support - this line is a workaround for v0 BYOK feature
-                provider_id=(
-                    self.provider_manager.get_anthropic_override_provider_id()
-                    if self.agent_state.llm_config.model_endpoint_type == "anthropic"
-                    else None
+                provider_id=self.provider_manager.get_provider_id_from_name(
+                    self.agent_state.llm_config.provider_name,
+                    actor=self.user,
                 ),
                 job_id=job_id,
             )
@@ -1091,7 +1095,9 @@ class Agent(BaseAgent):
                 LLM_MAX_TOKENS[self.model] if (self.model is not None and self.model in LLM_MAX_TOKENS) else LLM_MAX_TOKENS["DEFAULT"]
             )
 
-        summary = summarize_messages(agent_state=self.agent_state, message_sequence_to_summarize=message_sequence_to_summarize)
+        summary = summarize_messages(
+            agent_state=self.agent_state, message_sequence_to_summarize=message_sequence_to_summarize, actor=self.user
+        )
         logger.info(f"Got summary: {summary}")
 
         # Metadata that's useful for the agent to see
@@ -1103,7 +1109,7 @@ class Agent(BaseAgent):
         logger.info(f"Packaged into message: {summary_message}")
 
         prior_len = len(in_context_messages_openai)
-        self.agent_state = self.agent_manager.trim_all_in_context_messages_except_system(agent_id=self.agent_state.id, actor=self.user)
+        self.agent_state = self.agent_manager.trim_older_in_context_messages(num=cutoff, agent_id=self.agent_state.id, actor=self.user)
         packed_summary_message = {"role": "user", "content": summary_message}
         # Prepend the summary
         self.agent_state = self.agent_manager.prepend_to_in_context_messages(
@@ -1280,6 +1286,9 @@ class Agent(BaseAgent):
                 agent_state_copy = self.agent_state.__deepcopy__()
                 function_args["agent_state"] = agent_state_copy  # need to attach self to arg since it's dynamically linked
                 function_response = callable_func(**function_args)
+                self.ensure_read_only_block_not_modified(
+                    new_memory=agent_state_copy.memory
+                )  # memory editing tools cannot edit read-only blocks
                 self.update_memory_if_changed(agent_state_copy.memory)
             elif target_letta_tool.tool_type == ToolType.EXTERNAL_COMPOSIO:
                 action_name = generate_composio_action_from_func_name(target_letta_tool.name)

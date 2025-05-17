@@ -4,6 +4,8 @@ from logging import CRITICAL, DEBUG, ERROR, INFO, NOTSET, WARN, WARNING
 LETTA_DIR = os.path.join(os.path.expanduser("~"), ".letta")
 LETTA_TOOL_EXECUTION_DIR = os.path.join(LETTA_DIR, "tool_execution_dir")
 
+LETTA_MODEL_ENDPOINT = "https://inference.letta.com"
+
 ADMIN_PREFIX = "/v1/admin"
 API_PREFIX = "/v1"
 OPENAI_API_PREFIX = "/openai"
@@ -16,6 +18,8 @@ MCP_TOOL_TAG_NAME_PREFIX = "mcp"  # full format, mcp:server_name
 
 LETTA_CORE_TOOL_MODULE_NAME = "letta.functions.function_sets.base"
 LETTA_MULTI_AGENT_TOOL_MODULE_NAME = "letta.functions.function_sets.multi_agent"
+LETTA_VOICE_TOOL_MODULE_NAME = "letta.functions.function_sets.voice"
+
 
 # String in the error message for when the context window is too large
 # Example full message:
@@ -30,6 +34,10 @@ TOOL_CALL_ID_MAX_LEN = 29
 
 # minimum context window size
 MIN_CONTEXT_WINDOW = 4096
+
+# Voice Sleeptime message buffer lengths
+DEFAULT_MAX_MESSAGE_BUFFER_LENGTH = 30
+DEFAULT_MIN_MESSAGE_BUFFER_LENGTH = 15
 
 # embeddings
 MAX_EMBEDDING_DIM = 4096  # maximum supported embeding size - do NOT change or else DBs will need to be reset
@@ -65,10 +73,20 @@ BASE_SLEEPTIME_TOOLS = [
     # "archival_memory_search",
     # "conversation_search",
 ]
+# Base tools for the voice agent
+BASE_VOICE_SLEEPTIME_CHAT_TOOLS = [SEND_MESSAGE_TOOL_NAME, "search_memory"]
+# Base memory tools for sleeptime agent
+BASE_VOICE_SLEEPTIME_TOOLS = [
+    "store_memories",
+    "rethink_user_memory",
+    "finish_rethinking_memory",
+]
 # Multi agent tools
 MULTI_AGENT_TOOLS = ["send_message_to_agent_and_wait_for_reply", "send_message_to_agents_matching_tags", "send_message_to_agent_async"]
 # Set of all built-in Letta tools
-LETTA_TOOL_SET = set(BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS)
+LETTA_TOOL_SET = set(
+    BASE_TOOLS + BASE_MEMORY_TOOLS + MULTI_AGENT_TOOLS + BASE_SLEEPTIME_TOOLS + BASE_VOICE_SLEEPTIME_TOOLS + BASE_VOICE_SLEEPTIME_CHAT_TOOLS
+)
 
 # The name of the tool used to send message to the user
 # May not be relevant in cases where the agent has multiple ways to message to user (send_imessage, send_discord_mesasge, ...)
@@ -176,6 +194,9 @@ MESSAGE_SUMMARY_WARNING_STR = " ".join(
 DATA_SOURCE_ATTACH_ALERT = (
     "[ALERT] New data was just uploaded to archival memory. You can view this data by calling the archival_memory_search tool."
 )
+
+# Throw an error message when a read-only block is edited
+READ_ONLY_BLOCK_EDIT_ERROR = f"{ERROR_MESSAGE_PREFIX} This block is read-only and cannot be edited."
 
 # The ackknowledgement message used in the summarize sequence
 MESSAGE_SUMMARY_REQUEST_ACK = "Understood, I will respond with a summary of the message (and only the summary, nothing else) once I receive the conversation history. I'm ready."

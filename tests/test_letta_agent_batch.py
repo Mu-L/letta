@@ -1,6 +1,5 @@
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import AsyncMock, patch
@@ -24,7 +23,7 @@ from letta.helpers import ToolRulesSolver
 from letta.jobs.llm_batch_job_polling import poll_running_llm_batches
 from letta.orm import Base
 from letta.schemas.agent import AgentState, AgentStepState
-from letta.schemas.enums import AgentStepStatus, JobStatus, ProviderType
+from letta.schemas.enums import AgentStepStatus, JobStatus, MessageRole, ProviderType
 from letta.schemas.job import BatchJob
 from letta.schemas.letta_message_content import TextContent
 from letta.schemas.letta_request import LettaBatchRequest
@@ -32,6 +31,7 @@ from letta.schemas.message import MessageCreate
 from letta.schemas.tool_rule import InitToolRule
 from letta.server.db import db_context
 from letta.server.server import SyncServer
+from tests.utils import wait_for_server
 
 # --------------------------------------------------------------------------- #
 # Test Constants
@@ -311,7 +311,7 @@ def server_url():
     if not os.getenv("LETTA_SERVER_URL"):
         thread = threading.Thread(target=run_server, daemon=True)
         thread.start()
-        time.sleep(1)  # Give server time to start
+        wait_for_server(url)
 
     return url
 
@@ -368,7 +368,7 @@ class MockAsyncIterable:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_rethink_tool_modify_agent_state(client, disable_e2b_api_key, server, default_user, batch_job, rethink_tool):
     target_block_label = "human"
     new_memory = "banana"
@@ -450,7 +450,7 @@ async def test_rethink_tool_modify_agent_state(client, disable_e2b_api_key, serv
                         assert block.value == new_memory
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_partial_error_from_anthropic_batch(
     disable_e2b_api_key, server, default_user, agents: Tuple[AgentState], batch_requests, step_state_map, batch_job
 ):
@@ -509,13 +509,13 @@ async def test_partial_error_from_anthropic_batch(
                 new_batch_responses = await poll_running_llm_batches(server)
 
                 # Verify database records were updated correctly
-                llm_batch_job = server.batch_manager.get_llm_batch_job_by_id(llm_batch_job.id, actor=default_user)
+                llm_batch_job = await server.batch_manager.get_llm_batch_job_by_id_async(llm_batch_job.id, actor=default_user)
 
                 # Verify job properties
                 assert llm_batch_job.status == JobStatus.completed, "Job status should be 'completed'"
 
                 # Verify batch items
-                items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+                items = await server.batch_manager.list_llm_batch_items_async(llm_batch_id=llm_batch_job.id, actor=default_user)
                 assert len(items) == 3, f"Expected 3 batch items, got {len(items)}"
 
                 # Verify only one new batch response
@@ -533,7 +533,7 @@ async def test_partial_error_from_anthropic_batch(
                 assert post_resume_response.agent_count == 2
 
                 # New batch‑items should exist, initialised in (created, paused) state
-                new_items = server.batch_manager.list_llm_batch_items(
+                new_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=post_resume_response.last_llm_batch_id, actor=default_user
                 )
                 assert len(new_items) == 2, f"Expected 2 new batch item, got {len(new_items)}"
@@ -554,7 +554,7 @@ async def test_partial_error_from_anthropic_batch(
 
                 # Old items must have been flipped to completed / finished earlier
                 #     (sanity – we already asserted this above, but we keep it close for clarity)
-                old_items = server.batch_manager.list_llm_batch_items(
+                old_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=pre_resume_response.last_llm_batch_id, actor=default_user
                 )
                 for item in old_items:
@@ -589,8 +589,28 @@ async def test_partial_error_from_anthropic_batch(
                             len(refreshed_agent.message_ids) == 6
                         ), f"Agent's in-context messages have been extended, are length: {len(refreshed_agent.message_ids)}"
 
+                # Check the total list of messages
+                messages = server.batch_manager.get_messages_for_letta_batch(
+                    letta_batch_job_id=pre_resume_response.letta_batch_id, limit=200, actor=default_user
+                )
+                assert len(messages) == (len(agents) - 1) * 4 + 1
+                _assert_descending_order(messages)
+                # Check that each agent is represented
+                for agent in agents_continue:
+                    agent_messages = [m for m in messages if m.agent_id == agent.id]
+                    assert len(agent_messages) == 4
+                    assert agent_messages[-1].role == MessageRole.user, "Expected initial user message"
+                    assert agent_messages[-2].role == MessageRole.assistant, "Expected assistant tool call after user message"
+                    assert agent_messages[-3].role == MessageRole.tool, "Expected tool response after assistant tool call"
+                    assert agent_messages[-4].role == MessageRole.user, "Expected final system-level heartbeat user message"
 
-@pytest.mark.asyncio
+                for agent in agents_failed:
+                    agent_messages = [m for m in messages if m.agent_id == agent.id]
+                    assert len(agent_messages) == 1
+                    assert agent_messages[0].role == MessageRole.user, "Expected initial user message"
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_resume_step_some_stop(
     disable_e2b_api_key, server, default_user, agents: Tuple[AgentState], batch_requests, step_state_map, batch_job
 ):
@@ -651,13 +671,13 @@ async def test_resume_step_some_stop(
                 new_batch_responses = await poll_running_llm_batches(server)
 
                 # Verify database records were updated correctly
-                llm_batch_job = server.batch_manager.get_llm_batch_job_by_id(llm_batch_job.id, actor=default_user)
+                llm_batch_job = await server.batch_manager.get_llm_batch_job_by_id_async(llm_batch_job.id, actor=default_user)
 
                 # Verify job properties
                 assert llm_batch_job.status == JobStatus.completed, "Job status should be 'completed'"
 
                 # Verify batch items
-                items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+                items = await server.batch_manager.list_llm_batch_items_async(llm_batch_id=llm_batch_job.id, actor=default_user)
                 assert len(items) == 3, f"Expected 3 batch items, got {len(items)}"
                 assert all([item.request_status == JobStatus.completed for item in items])
 
@@ -676,7 +696,7 @@ async def test_resume_step_some_stop(
                 assert post_resume_response.agent_count == 1
 
                 # New batch‑items should exist, initialised in (created, paused) state
-                new_items = server.batch_manager.list_llm_batch_items(
+                new_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=post_resume_response.last_llm_batch_id, actor=default_user
                 )
                 assert len(new_items) == 1, f"Expected 1 new batch item, got {len(new_items)}"
@@ -697,7 +717,7 @@ async def test_resume_step_some_stop(
 
                 # Old items must have been flipped to completed / finished earlier
                 #     (sanity – we already asserted this above, but we keep it close for clarity)
-                old_items = server.batch_manager.list_llm_batch_items(
+                old_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=pre_resume_response.last_llm_batch_id, actor=default_user
                 )
                 assert {i.request_status for i in old_items} == {JobStatus.completed}
@@ -718,8 +738,42 @@ async def test_resume_step_some_stop(
                         len(refreshed_agent.message_ids) == 6
                     ), f"Agent's in-context messages have been extended, are length: {len(refreshed_agent.message_ids)}"
 
+                # Check the total list of messages
+                messages = server.batch_manager.get_messages_for_letta_batch(
+                    letta_batch_job_id=pre_resume_response.letta_batch_id, limit=200, actor=default_user
+                )
+                assert len(messages) == len(agents) * 3 + 1
+                _assert_descending_order(messages)
+                # Check that each agent is represented
+                for agent in agents_continue:
+                    agent_messages = [m for m in messages if m.agent_id == agent.id]
+                    assert len(agent_messages) == 4
+                    assert agent_messages[-1].role == MessageRole.user, "Expected initial user message"
+                    assert agent_messages[-2].role == MessageRole.assistant, "Expected assistant tool call after user message"
+                    assert agent_messages[-3].role == MessageRole.tool, "Expected tool response after assistant tool call"
+                    assert agent_messages[-4].role == MessageRole.user, "Expected final system-level heartbeat user message"
 
-@pytest.mark.asyncio
+                for agent in agents_finish:
+                    agent_messages = [m for m in messages if m.agent_id == agent.id]
+                    assert len(agent_messages) == 3
+                    assert agent_messages[-1].role == MessageRole.user, "Expected initial user message"
+                    assert agent_messages[-2].role == MessageRole.assistant, "Expected assistant tool call after user message"
+                    assert agent_messages[-3].role == MessageRole.tool, "Expected tool response after assistant tool call"
+
+
+def _assert_descending_order(messages):
+    """Assert messages are in monotonically decreasing by created_at timestamps."""
+    if len(messages) <= 1:
+        return True
+
+    for prev, next in zip(messages[:-1], messages[1:]):
+        assert (
+            prev.created_at >= next.created_at
+        ), f"Order violation: {prev.id} ({prev.created_at}) followed by {next.id} ({next.created_at})"
+    return True
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_resume_step_after_request_all_continue(
     disable_e2b_api_key, server, default_user, agents: Tuple[AgentState], batch_requests, step_state_map, batch_job
 ):
@@ -755,7 +809,7 @@ async def test_resume_step_after_request_all_continue(
         assert len(llm_batch_jobs) == 1, f"Expected 1 llm_batch_jobs, got {len(llm_batch_jobs)}"
 
         llm_batch_job = llm_batch_jobs[0]
-        llm_batch_items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+        llm_batch_items = await server.batch_manager.list_llm_batch_items_async(llm_batch_id=llm_batch_job.id, actor=default_user)
         assert len(llm_batch_items) == 3, f"Expected 3 llm_batch_items, got {len(llm_batch_items)}"
 
     # 2. Invoke the polling job and mock responses from Anthropic
@@ -777,13 +831,13 @@ async def test_resume_step_after_request_all_continue(
                 new_batch_responses = await poll_running_llm_batches(server)
 
                 # Verify database records were updated correctly
-                llm_batch_job = server.batch_manager.get_llm_batch_job_by_id(llm_batch_job.id, actor=default_user)
+                llm_batch_job = await server.batch_manager.get_llm_batch_job_by_id_async(llm_batch_job.id, actor=default_user)
 
                 # Verify job properties
                 assert llm_batch_job.status == JobStatus.completed, "Job status should be 'completed'"
 
                 # Verify batch items
-                items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+                items = await server.batch_manager.list_llm_batch_items_async(llm_batch_id=llm_batch_job.id, actor=default_user)
                 assert len(items) == 3, f"Expected 3 batch items, got {len(items)}"
                 assert all([item.request_status == JobStatus.completed for item in items])
 
@@ -801,7 +855,7 @@ async def test_resume_step_after_request_all_continue(
                 assert post_resume_response.agent_count == 3
 
                 # New batch‑items should exist, initialised in (created, paused) state
-                new_items = server.batch_manager.list_llm_batch_items(
+                new_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=post_resume_response.last_llm_batch_id, actor=default_user
                 )
                 assert len(new_items) == 3, f"Expected 3 new batch items, got {len(new_items)}"
@@ -820,7 +874,7 @@ async def test_resume_step_after_request_all_continue(
 
                 # Old items must have been flipped to completed / finished earlier
                 #     (sanity – we already asserted this above, but we keep it close for clarity)
-                old_items = server.batch_manager.list_llm_batch_items(
+                old_items = await server.batch_manager.list_llm_batch_items_async(
                     llm_batch_id=pre_resume_response.last_llm_batch_id, actor=default_user
                 )
                 assert {i.request_status for i in old_items} == {JobStatus.completed}
@@ -841,8 +895,23 @@ async def test_resume_step_after_request_all_continue(
                         len(refreshed_agent.message_ids) == 6
                     ), f"Agent's in-context messages have been extended, are length: {len(refreshed_agent.message_ids)}"
 
+                # Check the total list of messages
+                messages = server.batch_manager.get_messages_for_letta_batch(
+                    letta_batch_job_id=pre_resume_response.letta_batch_id, limit=200, actor=default_user
+                )
+                assert len(messages) == len(agents) * 4
+                _assert_descending_order(messages)
+                # Check that each agent is represented
+                for agent in agents:
+                    agent_messages = [m for m in messages if m.agent_id == agent.id]
+                    assert len(agent_messages) == 4
+                    assert agent_messages[-1].role == MessageRole.user, "Expected initial user message"
+                    assert agent_messages[-2].role == MessageRole.assistant, "Expected assistant tool call after user message"
+                    assert agent_messages[-3].role == MessageRole.tool, "Expected tool response after assistant tool call"
+                    assert agent_messages[-4].role == MessageRole.user, "Expected final system-level heartbeat user message"
 
-@pytest.mark.asyncio
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_step_until_request_prepares_and_submits_batch_correctly(
     disable_e2b_api_key, server, default_user, agents, batch_requests, step_state_map, dummy_batch_response, batch_job
 ):
@@ -935,7 +1004,7 @@ async def test_step_until_request_prepares_and_submits_batch_correctly(
         assert len(llm_batch_jobs) == 1, f"Expected 1 llm_batch_jobs, got {len(llm_batch_jobs)}"
 
         llm_batch_job = llm_batch_jobs[0]
-        llm_batch_items = server.batch_manager.list_llm_batch_items(llm_batch_id=llm_batch_job.id, actor=default_user)
+        llm_batch_items = await server.batch_manager.list_llm_batch_items_async(llm_batch_id=llm_batch_job.id, actor=default_user)
         assert len(llm_batch_items) == 3, f"Expected 3 llm_batch_items, got {len(llm_batch_items)}"
 
         # Verify job properties

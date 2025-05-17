@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 import time
@@ -1031,7 +1032,7 @@ class RESTClient(AbstractClient):
             #     messages = []
             #     for m in response.messages:
             #         assert isinstance(m, Message)
-            #         messages += m.to_letta_message()
+            #         messages += m.to_letta_messages()
             #     response.messages = messages
 
             return response
@@ -2725,14 +2726,14 @@ class LocalClient(AbstractClient):
         #    assert isinstance(m, Message), f"Expected Message object, got {type(m)}"
         # letta_messages = []
         # for m in messages:
-        #    letta_messages += m.to_letta_message()
+        #    letta_messages += m.to_letta_messages()
         # return LettaResponse(messages=letta_messages, usage=usage)
 
         # format messages
         messages = self.interface.to_list()
         letta_messages = []
         for m in messages:
-            letta_messages += m.to_letta_message()
+            letta_messages += m.to_letta_messages()
 
         return LettaResponse(messages=letta_messages, usage=usage)
 
@@ -3055,7 +3056,21 @@ class LocalClient(AbstractClient):
         Returns:
             tools (List[Tool]): List of tools
         """
-        return self.server.tool_manager.list_tools(after=after, limit=limit, actor=self.user)
+        # Get the current event loop or create a new one if there isn't one
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context but can't await - use a new loop via run_coroutine_threadsafe
+                concurrent_future = asyncio.run_coroutine_threadsafe(
+                    self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit), loop
+                )
+                return concurrent_future.result()
+            else:
+                # We have a loop but it's not running - we can just run the coroutine
+                return loop.run_until_complete(self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit))
+        except RuntimeError:
+            # No running event loop - create a new one with asyncio.run
+            return asyncio.run(self.server.tool_manager.list_tools_async(actor=self.user, after=after, limit=limit))
 
     def get_tool(self, id: str) -> Optional[Tool]:
         """
@@ -3455,7 +3470,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[LLMConfig]): List of LLM configurations
         """
-        return self.server.list_llm_models()
+        return self.server.list_llm_models(actor=self.user)
 
     def list_embedding_configs(self) -> List[EmbeddingConfig]:
         """
@@ -3464,7 +3479,7 @@ class LocalClient(AbstractClient):
         Returns:
             configs (List[EmbeddingConfig]): List of embedding configurations
         """
-        return self.server.list_embedding_models()
+        return self.server.list_embedding_models(actor=self.user)
 
     def create_org(self, name: Optional[str] = None) -> Organization:
         return self.server.organization_manager.create_organization(pydantic_org=Organization(name=name))

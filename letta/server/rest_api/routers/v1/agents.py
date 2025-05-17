@@ -3,7 +3,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from marshmallow import ValidationError
 from orjson import orjson
@@ -13,6 +13,7 @@ from starlette.responses import Response, StreamingResponse
 
 from letta.agents.letta_agent import LettaAgent
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.helpers.datetime_helpers import get_utc_timestamp_ns
 from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
@@ -43,7 +44,7 @@ logger = get_logger(__name__)
 
 
 @router.get("/", response_model=List[AgentState], operation_id="list_agents")
-def list_agents(
+async def list_agents(
     name: Optional[str] = Query(None, description="Name of the agent"),
     tags: Optional[List[str]] = Query(None, description="List of tags to filter agents by"),
     match_all_tags: bool = Query(
@@ -82,10 +83,10 @@ def list_agents(
     """
 
     # Retrieve the actor (user) details
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     # Call list_agents directly without unnecessary dict handling
-    return server.agent_manager.list_agents(
+    return await server.agent_manager.list_agents_async(
         actor=actor,
         name=name,
         before=before,
@@ -162,7 +163,7 @@ async def import_agent_serialized(
     """
     Import a serialized agent file and recreate the agent in the system.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     try:
         serialized_data = await file.read()
@@ -222,7 +223,7 @@ class CreateAgentRequest(CreateAgent):
 
 
 @router.post("/", response_model=AgentState, operation_id="create_agent")
-def create_agent(
+async def create_agent(
     agent: CreateAgentRequest = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -232,23 +233,23 @@ def create_agent(
     Create a new agent with the specified configuration.
     """
     try:
-        actor = server.user_manager.get_user_or_default(user_id=actor_id)
-        return server.create_agent(agent, actor=actor)
+        actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+        return await server.create_agent_async(agent, actor=actor)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/{agent_id}", response_model=AgentState, operation_id="modify_agent")
-def modify_agent(
+async def modify_agent(
     agent_id: str,
     update_agent: UpdateAgent = Body(...),
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """Update an existing agent"""
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
-    return server.update_agent(agent_id=agent_id, request=update_agent, actor=actor)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
+    return await server.update_agent_async(agent_id=agent_id, request=update_agent, actor=actor)
 
 
 @router.get("/{agent_id}/tools", response_model=List[Tool], operation_id="list_agent_tools")
@@ -332,7 +333,7 @@ def detach_source(
 
 
 @router.get("/{agent_id}", response_model=AgentState, operation_id="retrieve_agent")
-def retrieve_agent(
+async def retrieve_agent(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -343,7 +344,7 @@ def retrieve_agent(
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
 
     try:
-        return server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
+        return await server.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
     except NoResultFound as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -413,7 +414,7 @@ def retrieve_block(
 
 
 @router.get("/{agent_id}/core-memory/blocks", response_model=List[Block], operation_id="list_core_memory_blocks")
-def list_blocks(
+async def list_blocks(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -423,7 +424,7 @@ def list_blocks(
     """
     actor = server.user_manager.get_user_or_default(user_id=actor_id)
     try:
-        agent = server.agent_manager.get_agent_by_id(agent_id, actor)
+        agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
         return agent.memory.blocks
     except NoResultFound as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -618,6 +619,7 @@ def modify_message(
 )
 async def send_message(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
@@ -626,17 +628,15 @@ async def send_message(
     Process a user message and return the agent's response.
     This endpoint accepts a message from a user and processes it through the agent.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
     # TODO: This is redundant, remove soon
-    agent = server.agent_manager.get_agent_by_id(agent_id, actor)
+    agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("X-EXPERIMENTAL") or "false"
+    feature_enabled = settings.use_experimental or experimental_header.lower() == "true"
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai", "google_vertex", "google_ai"]
 
-    if (
-        agent.llm_config.model_endpoint_type == "anthropic"
-        and not agent.enable_sleeptime
-        and not agent.multi_agent_group
-        and not agent.agent_type == AgentType.sleeptime_agent
-        and settings.use_experimental
-    ):
+    if agent_eligible and feature_enabled and model_compatible:
         experimental_agent = LettaAgent(
             agent_id=agent_id,
             message_manager=server.message_manager,
@@ -646,7 +646,7 @@ async def send_message(
             actor=actor,
         )
 
-        result = await experimental_agent.step(request.messages, max_steps=10)
+        result = await experimental_agent.step(request.messages, max_steps=10, use_assistant_message=request.use_assistant_message)
     else:
         result = await server.send_message_to_agent(
             agent_id=agent_id,
@@ -669,34 +669,32 @@ async def send_message(
     responses={
         200: {
             "description": "Successful response",
-            "content": {
-                "text/event-stream": {"description": "Server-Sent Events stream"},
-            },
+            "content": {"text/event-stream": {}},
         }
     },
 )
 async def send_message_streaming(
     agent_id: str,
+    request_obj: Request,  # FastAPI Request
     server: SyncServer = Depends(get_letta_server),
     request: LettaStreamingRequest = Body(...),
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
-):
+) -> StreamingResponse | LettaResponse:
     """
     Process a user message and return the agent's response.
     This endpoint accepts a message from a user and processes it through the agent.
     It will stream the steps of the response always, and stream the tokens if 'stream_tokens' is set to True.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    request_start_timestamp_ns = get_utc_timestamp_ns()
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
     # TODO: This is redundant, remove soon
-    agent = server.agent_manager.get_agent_by_id(agent_id, actor)
+    agent = await server.agent_manager.get_agent_by_id_async(agent_id, actor)
+    agent_eligible = not agent.enable_sleeptime and not agent.multi_agent_group and agent.agent_type != AgentType.sleeptime_agent
+    experimental_header = request_obj.headers.get("X-EXPERIMENTAL") or "false"
+    feature_enabled = settings.use_experimental or experimental_header.lower() == "true"
+    model_compatible = agent.llm_config.model_endpoint_type in ["anthropic", "openai"]
 
-    if (
-        agent.llm_config.model_endpoint_type == "anthropic"
-        and not agent.enable_sleeptime
-        and not agent.multi_agent_group
-        and not agent.agent_type == AgentType.sleeptime_agent
-        and settings.use_experimental
-    ):
+    if agent_eligible and feature_enabled and model_compatible and request.stream_tokens:
         experimental_agent = LettaAgent(
             agent_id=agent_id,
             message_manager=server.message_manager,
@@ -707,7 +705,9 @@ async def send_message_streaming(
         )
 
         result = StreamingResponse(
-            experimental_agent.step_stream(request.messages, max_steps=10, use_assistant_message=request.use_assistant_message),
+            experimental_agent.step_stream(
+                request.messages, max_steps=10, use_assistant_message=request.use_assistant_message, stream_tokens=request.stream_tokens
+            ),
             media_type="text/event-stream",
         )
     else:
@@ -721,6 +721,7 @@ async def send_message_streaming(
             use_assistant_message=request.use_assistant_message,
             assistant_message_tool_name=request.assistant_message_tool_name,
             assistant_message_tool_kwarg=request.assistant_message_tool_kwarg,
+            request_start_timestamp_ns=request_start_timestamp_ns,
         )
 
     return result
@@ -785,7 +786,7 @@ async def send_message_async(
     Asynchronously process a user message and return a run object.
     The actual processing happens in the background, and the status can be checked using the run ID.
     """
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
 
     # Create a new job
     run = Run(
@@ -839,6 +840,6 @@ async def list_agent_groups(
     actor_id: Optional[str] = Header(None, alias="user_id"),  # Extract user_id from header, default to None if not present
 ):
     """Lists the groups for an agent"""
-    actor = server.user_manager.get_user_or_default(user_id=actor_id)
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=actor_id)
     print("in list agents with manager_type", manager_type)
     return server.agent_manager.list_groups(agent_id=agent_id, manager_type=manager_type, actor=actor)
